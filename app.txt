@@ -137,29 +137,76 @@ _opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(_jar))
 _crumb = {"v": None, "t": 0}
 
 
-def http_get(url, timeout=12, headers=None):
-    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "*/*",
-                                               "Accept-Language": "en-US,en;q=0.9", **(headers or {})})
+_dbg = []
+
+
+def dbg(msg):
+    _dbg.append(time.strftime("%H:%M:%S ") + str(msg)[:200])
+    del _dbg[:-60]
+
+
+def http_get(url, timeout=12, headers=None, data=None):
+    req = urllib.request.Request(url, data=data, headers={"User-Agent": UA, "Accept": "*/*",
+                                                          "Accept-Language": "en-US,en;q=0.9", **(headers or {})})
     with _opener.open(req, timeout=timeout) as r:
         return r.read()
+
+
+def _try_crumb():
+    for host in ("query1", "query2"):
+        try:
+            c = http_get(f"https://{host}.finance.yahoo.com/v1/test/getcrumb", timeout=8,
+                         headers={"Referer": "https://finance.yahoo.com/"}).decode().strip()
+            dbg(f"getcrumb {host}: ok len={len(c)}")
+            if c and "<" not in c and " " not in c and len(c) < 60:
+                return c
+        except urllib.error.HTTPError as e:
+            dbg(f"getcrumb {host}: HTTP {e.code}")
+        except Exception as e:
+            dbg(f"getcrumb {host}: {type(e).__name__} {e}")
+    return None
+
+
+def _consent(body):
+    """Accept Yahoo's cookie-consent page if the server is shown one."""
+    try:
+        text = body.decode("utf-8", "ignore")
+        m = re.search(r'<form[^>]+action="([^"]+)"', text)
+        if not m or "csrfToken" not in text:
+            return
+        fields = dict(re.findall(r'<input[^>]+name="([^"]+)"[^>]*value="([^"]*)"', text))
+        fields["agree"] = "agree"
+        url = html.unescape(m.group(1))
+        if url.startswith("/"):
+            url = "https://consent.yahoo.com" + url
+        http_get(url, timeout=10, data=urllib.parse.urlencode(fields).encode(),
+                 headers={"Content-Type": "application/x-www-form-urlencoded"})
+        dbg("consent form submitted")
+    except Exception as e:
+        dbg(f"consent: {e}")
 
 
 def get_crumb(force=False):
     with LOCK:
         if _crumb["v"] and not force and time.time() - _crumb["t"] < 3600:
             return _crumb["v"]
-        try:
-            http_get("https://fc.yahoo.com", timeout=8)
-        except Exception:
-            pass  # this endpoint returns 404 but still sets the cookie
-        for host in ("query1", "query2"):
+        if force:
+            _jar.clear()
+        for name, url in (("fc.yahoo.com", "https://fc.yahoo.com"),
+                          ("finance.yahoo.com", "https://finance.yahoo.com/quote/AAPL")):
             try:
-                c = http_get(f"https://{host}.finance.yahoo.com/v1/test/getcrumb", timeout=8).decode().strip()
-                if c and "<" not in c:
-                    _crumb.update(v=c, t=time.time())
-                    return c
-            except Exception:
-                continue
+                body = http_get(url, timeout=10)
+                dbg(f"{name}: {len(body)} bytes")
+                if name != "fc.yahoo.com":
+                    _consent(body)
+            except urllib.error.HTTPError as e:
+                dbg(f"{name}: HTTP {e.code}")  # fc.yahoo.com answers 404 but still sets the cookie
+            except Exception as e:
+                dbg(f"{name}: {type(e).__name__} {e}")
+            c = _try_crumb()
+            if c:
+                _crumb.update(v=c, t=time.time())
+                return c
     return None
 
 
@@ -219,6 +266,74 @@ def fetch_summary(symbol):
                 continue
             raise
     return {}
+
+
+TS_TYPES = ["trailingPeRatio", "trailingForwardPeRatio", "trailingPbRatio", "trailingPsRatio",
+            "trailingEnterprisesValueEBITDARatio", "trailingPegRatio", "trailingMarketCap",
+            "quarterlyTotalRevenue", "quarterlyNetIncome", "quarterlyOperatingIncome", "quarterlyGrossProfit",
+            "quarterlyDilutedEPS", "quarterlyTotalDebt", "quarterlyCashAndCashEquivalents",
+            "quarterlyStockholdersEquity", "quarterlyOperatingCashFlow", "quarterlyFreeCashFlow",
+            "quarterlyCurrentAssets", "quarterlyCurrentLiabilities", "quarterlyTotalAssets"]
+
+
+def fetch_timeseries(symbol):
+    now = int(time.time())
+    params = {"symbol": symbol, "type": ",".join(TS_TYPES), "period1": now - 4 * 365 * 86400, "period2": now + 86400}
+    d = yahoo_json("/ws/fundamentals-timeseries/v1/finance/timeseries/" + urllib.parse.quote(symbol), params)
+    out = {}
+    for r in (d.get("timeseries") or {}).get("result", []) or []:
+        t = (r.get("meta", {}).get("type") or [None])[0]
+        vals = []
+        for it in r.get(t) or []:
+            if not it:
+                continue
+            v = raw(it.get("reportedValue"))
+            if v is not None:
+                vals.append((it.get("asOfDate", ""), v))
+        vals.sort()
+        if t:
+            out[t] = vals
+    return out
+
+
+def fund_from_ts(ts):
+    def lst(t):
+        return [v for _, v in ts.get(t, [])]
+
+    def latest(t):
+        a = lst(t)
+        return a[-1] if a else None
+
+    def ttm(t):
+        a = lst(t)
+        return sum(a[-4:]) if len(a) >= 4 else None
+
+    def ratio(a, b):
+        return a / b if a is not None and b not in (None, 0) else None
+    f = {"trailingPE": latest("trailingPeRatio"), "forwardPE": latest("trailingForwardPeRatio"),
+         "priceToBook": latest("trailingPbRatio"), "priceToSalesTrailing12Months": latest("trailingPsRatio"),
+         "enterpriseToEbitda": latest("trailingEnterprisesValueEBITDARatio"), "pegRatio": latest("trailingPegRatio"),
+         "marketCap": latest("trailingMarketCap")}
+    rev, ni, op, gp = ttm("quarterlyTotalRevenue"), ttm("quarterlyNetIncome"), ttm("quarterlyOperatingIncome"), ttm("quarterlyGrossProfit")
+    eq, assets, debt = latest("quarterlyStockholdersEquity"), latest("quarterlyTotalAssets"), latest("quarterlyTotalDebt")
+    f["profitMargins"] = ratio(ni, rev)
+    f["operatingMargins"] = ratio(op, rev)
+    f["grossMargins"] = ratio(gp, rev)
+    f["returnOnEquity"] = ratio(ni, eq)
+    f["returnOnAssets"] = ratio(ni, assets)
+    f["debtToEquity"] = ratio(debt, eq) * 100 if ratio(debt, eq) is not None else None
+    f["currentRatio"] = ratio(latest("quarterlyCurrentAssets"), latest("quarterlyCurrentLiabilities"))
+    f["totalCash"], f["totalDebt"] = latest("quarterlyCashAndCashEquivalents"), debt
+    f["freeCashflow"], f["operatingCashflow"] = ttm("quarterlyFreeCashFlow"), ttm("quarterlyOperatingCashFlow")
+    f["trailingEps"] = ttm("quarterlyDilutedEPS")
+    for key, t in (("revenueGrowth", "quarterlyTotalRevenue"), ("earningsGrowth", "quarterlyNetIncome")):
+        a = lst(t)
+        if len(a) >= 5 and a[-5] and a[-5] > 0:
+            f[key] = a[-1] / a[-5] - 1
+    f = {k: v for k, v in f.items() if v is not None}
+    rv, nets = ts.get("quarterlyTotalRevenue", []), dict(ts.get("quarterlyNetIncome", []))
+    quarterly = [{"date": d, "revenue": v, "earnings": nets.get(d)} for d, v in rv[-6:]]
+    return f, quarterly
 
 
 def flatten_fund(qs):
@@ -382,12 +497,29 @@ def live_bundle(symbol):
             warn = None
         except Exception as e:
             qs, warn = {}, f"Fundamentals unavailable ({e})"
+            dbg(f"quoteSummary {symbol}: {e}")
     fund = flatten_fund(qs)
+    extra_q = None
+    if not fund:
+        try:
+            ts_fund, extra_q = fund_from_ts(fetch_timeseries(symbol))
+            if ts_fund:
+                fund = ts_fund
+                warn = "Yahoo blocked the detailed data request, so a reduced fundamentals source is used. Some metrics, analyst data and EPS history are missing."
+        except Exception as e:
+            dbg(f"timeseries {symbol}: {e}")
+            warn = (warn or "") + f" Backup source also failed ({e})."
     name = meta.get("longName") or meta.get("shortName") or fund.get("longName") or symbol
     price = meta.get("regularMarketPrice")
     prev = meta.get("chartPreviousClose") or (hist["c"][-2] if len(hist["c"]) > 1 else price)
     prev = meta.get("previousClose") or prev
     news = build_news(symbol, name)
+    profile = parse_profile(qs)
+    if not profile.get("industry") and re.search(r"bank|finance|financial|insurance|lending", name or "", re.I):
+        profile["industry"] = "Banks - Regional"
+    earn = parse_earnings(qs)
+    if extra_q and not earn["quarterly"]:
+        earn["quarterly"] = extra_q
     return {
         "symbol": symbol, "name": name, "exchange": meta.get("fullExchangeName") or meta.get("exchangeName"),
         "currency": meta.get("currency", ""), "price": price, "prevClose": prev,
@@ -396,7 +528,7 @@ def live_bundle(symbol):
         "dayHigh": meta.get("regularMarketDayHigh"), "dayLow": meta.get("regularMarketDayLow"),
         "volume": meta.get("regularMarketVolume"),
         "w52High": meta.get("fiftyTwoWeekHigh"), "w52Low": meta.get("fiftyTwoWeekLow"),
-        "history": hist, "fund": fund, "earnings": parse_earnings(qs), "profile": parse_profile(qs),
+        "history": hist, "fund": fund, "earnings": earn, "profile": profile,
         "news": news, "newsSummary": news_summary(news), "warning": warn,
         "fetchedAt": int(time.time()), "demo": False,
     }
@@ -611,6 +743,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(200, page, "text/html; charset=utf-8")
             if u.path == "/api/portfolio":
                 return self.send(200, load_portfolio())
+            if u.path == "/api/debug":
+                c = get_crumb(force=True)
+                return self.send(200, {"crumb_ok": bool(c), "log": _dbg[-40:]})
             if u.path == "/api/search":
                 return self.send(200, search(qs.get("q", [""])[0]))
             if u.path == "/api/stock":
