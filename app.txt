@@ -1,0 +1,681 @@
+#!/usr/bin/env python3
+"""
+Stock Desk - personal portfolio app with live data.
+
+Run:   python stock_desk.py
+Then it opens http://127.0.0.1:8765 in your browser.
+
+Needs only Python 3.8+ (no extra packages) and an internet connection.
+Data: Yahoo Finance (prices, fundamentals, earnings) and Google News + Yahoo news (headlines).
+Your portfolio is saved next to this file in portfolio.json.
+
+Options:
+  --port 8765     change the port
+  --no-browser    do not open the browser automatically
+  --demo          use made-up sample data (for trying the app offline)
+"""
+import argparse
+import concurrent.futures as cf
+import base64
+import hashlib
+import hmac
+import html
+import http.cookiejar
+import json
+import math
+import os
+import random
+import re
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import webbrowser
+import xml.etree.ElementTree as ET
+from email.utils import parsedate_to_datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+PORTFOLIO_FILE = os.path.join(HERE, "portfolio.json")
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+DEMO = False
+HOSTED = False
+PASSWORD = os.environ.get("APP_PASSWORD", "")
+INDEX_HTML = '<!doctype html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n<meta name="viewport" content="width=device-width, initial-scale=1">\n<meta name="theme-color" content="#0b5f7a">\n<meta name="apple-mobile-web-app-capable" content="yes">\n<title>Stock Desk</title>\n<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,800&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">\n<style>\n/* Layout: header + summary tiles, add-stock bar, then holdings and news; stock pages use tabs (Overview, Fundamentals, Technicals, Earnings, News). */\n:root{\n  --bg:#f3f5f7; --panel:#ffffff; --fg:#14202b; --muted:#566673; --line:#dce2e7;\n  --accent:#0b5f7a; --accent-soft:#e1f0f5;\n  --pos:#0c7a43; --pos-bg:#dff3e8; --neg:#b3261e; --neg-bg:#fbe5e3; --neu:#85580a; --neu-bg:#faefd2;\n  --display:"Bricolage Grotesque","Segoe UI",system-ui,sans-serif;\n  --body:"IBM Plex Sans","Segoe UI",system-ui,sans-serif;\n  --mono:"IBM Plex Mono",ui-monospace,Menlo,Consolas,monospace;\n}\n@media (prefers-color-scheme: dark){:root{\n  --bg:#0e161d; --panel:#16212a; --fg:#e6edf2; --muted:#9aa9b5; --line:#27353f;\n  --accent:#5cc3df; --accent-soft:#173542;\n  --pos:#4cd08b; --pos-bg:#143a28; --neg:#ff8a80; --neg-bg:#3d1c1a; --neu:#f1c15a; --neu-bg:#3a2f12; color-scheme:dark}}\n*{box-sizing:border-box}\nhtml,body{margin:0}\nbody{background:var(--bg);color:var(--fg);font-family:var(--body);font-size:14px;line-height:1.5;padding:20px 16px 60px}\n.wrap{max-width:1200px;margin:0 auto;display:flex;flex-direction:column;gap:18px}\nh1,h2,h3{font-family:var(--display);margin:0;text-wrap:balance;letter-spacing:-.01em}\nh1{font-size:28px;font-weight:800}h2{font-size:17px;font-weight:600}h3{font-size:14.5px;font-weight:600}\n.mono,td.n{font-family:var(--mono);font-variant-numeric:tabular-nums}\na{color:var(--accent)}\n.sub,.note{color:var(--muted)}.sub{font-size:12px}.note{font-size:12px}\nheader.top{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:flex-end;gap:10px 16px}\n.demo{background:var(--neu-bg);color:var(--neu);padding:8px 12px;border-radius:6px;font-weight:600}\n.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px}\n.tile{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:12px 14px;min-width:0}\n.tile .l{font-size:11px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted)}\n.tile .v{font-family:var(--mono);font-size:20px;font-weight:500;margin-top:2px;overflow-wrap:anywhere}\n.grid2{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(0,1fr);gap:18px;align-items:start}\n@media(max-width:900px){.grid2{grid-template-columns:minmax(0,1fr)}}\n.card{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:14px;min-width:0}\n.card-h{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:8px;margin-bottom:10px}\n.scroll{overflow-x:auto}\ntable{border-collapse:collapse;width:100%}\nth{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);font-weight:500;text-align:left;padding:6px 8px;border-bottom:1px solid var(--line);white-space:nowrap}\nth.n,td.n{text-align:right}\ntd{padding:9px 8px;border-bottom:1px solid var(--line);vertical-align:middle}\ntr.row{cursor:pointer}tr.row:hover,tr.row:focus-visible{background:var(--accent-soft);outline:none}\n.sym{font-weight:600}.up{color:var(--pos)}.dn{color:var(--neg)}\n.pill{display:inline-flex;align-items:center;gap:4px;font-size:11.5px;font-weight:600;padding:2px 9px;border-radius:99px;white-space:nowrap}\n.pill.pos{background:var(--pos-bg);color:var(--pos)}.pill.neg{background:var(--neg-bg);color:var(--neg)}.pill.neu{background:var(--neu-bg);color:var(--neu)}.pill.na{background:var(--bg);color:var(--muted)}\n.chip{font-size:11.5px;color:var(--muted);border:1px solid var(--line);border-radius:4px;padding:1px 7px}\nbutton,select,input{font:inherit;color:var(--fg)}\nbutton{background:var(--panel);border:1px solid var(--line);border-radius:5px;padding:6px 12px;cursor:pointer}\nbutton:hover{border-color:var(--accent)}\nbutton:focus-visible,select:focus-visible,input:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--accent);outline-offset:1px}\nbutton.primary{background:var(--accent);border-color:var(--accent);color:var(--bg);font-weight:600}\nbutton.on{background:var(--accent-soft);border-color:var(--accent);font-weight:600}\nbutton.link{border:0;background:none;color:var(--muted);padding:2px 6px}\nbutton:disabled{opacity:.5;cursor:default}\nselect,input{background:var(--bg);border:1px solid var(--line);border-radius:5px;padding:6px 9px;min-width:0}\n.chips{display:flex;gap:6px;flex-wrap:wrap}\n.addbar{display:flex;flex-wrap:wrap;gap:8px;align-items:flex-end}\n.addbar label{display:flex;flex-direction:column;gap:3px;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}\n.searchbox{position:relative;flex:1 1 260px;min-width:0}\n.searchbox input{width:100%}\n.results{position:absolute;z-index:5;left:0;right:0;top:100%;margin-top:2px;background:var(--panel);border:1px solid var(--line);border-radius:6px;box-shadow:0 6px 24px rgba(0,0,0,.18);max-height:300px;overflow:auto}\n.results button{display:flex;width:100%;justify-content:space-between;gap:10px;border:0;border-radius:0;text-align:left;border-bottom:1px solid var(--line)}\n.results button:hover{background:var(--accent-soft)}\n.addbar input.s{width:100px}\n.news{display:flex;flex-direction:column}\n.ni{padding:12px 0;border-bottom:1px solid var(--line);display:flex;flex-direction:column;gap:5px}.ni:last-child{border:0}\n.ni .t{font-weight:500;font-size:14.5px}.ni .t a{color:var(--fg);text-decoration:none}.ni .t a:hover{text-decoration:underline}\n.ni .sm{color:var(--muted);font-size:13px}\n.meta{display:flex;flex-wrap:wrap;gap:6px 10px;align-items:center;font-size:12px;color:var(--muted)}\n.why{font-size:12px;color:var(--muted)}\n.tabs{display:flex;gap:4px;flex-wrap:wrap;border-bottom:1px solid var(--line)}\n.tabs button{border:0;border-bottom:3px solid transparent;border-radius:0;background:none;padding:9px 14px;color:var(--muted)}\n.tabs button.on{border-color:var(--accent);color:var(--fg);background:none;font-weight:600}\n.dhead{display:flex;flex-wrap:wrap;justify-content:space-between;gap:12px;align-items:flex-end}\n.px{font-family:var(--mono);font-size:28px;font-weight:500}\n.badges{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}\n.cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:18px}\n.metric{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:2px 14px;padding:10px 0;border-bottom:1px solid var(--line)}\n.metric:last-child{border:0}\n.metric .nm{font-weight:500}.metric .val{font-family:var(--mono);text-align:right;font-weight:500}\n.metric .ex{grid-column:1/-1;font-size:12px;color:var(--muted)}\n.verdict{display:flex;flex-wrap:wrap;gap:10px;align-items:center;padding:10px 12px;border-radius:6px;margin-bottom:6px}\n.verdict.pos{background:var(--pos-bg)}.verdict.neg{background:var(--neg-bg)}.verdict.neu{background:var(--neu-bg)}\n.verdict b{font-family:var(--display);font-size:17px}\n.bar{height:8px;border-radius:4px;background:var(--bg);border:1px solid var(--line);overflow:hidden;display:flex;min-width:80px}\n.bar i{display:block;height:100%}\n.bar .p{background:var(--pos)}.bar .u{background:var(--neu)}.bar .g{background:var(--neg)}\nul.pts{margin:0;padding-left:18px;display:flex;flex-direction:column;gap:5px}\nsvg.chart{width:100%;height:auto;display:block}\n.chart text{font-family:var(--mono);font-size:10px;fill:var(--muted)}\n.range{position:relative;height:8px;border-radius:4px;background:var(--line);margin:22px 0 6px}\n.range b{position:absolute;top:-5px;width:4px;height:18px;border-radius:2px;background:var(--fg)}\n.loading{color:var(--muted);padding:20px 0}\n.err{color:var(--neg)}\n@media (prefers-reduced-motion:no-preference){tr.row{transition:background .12s}}\n</style>\n</head>\n<body>\n<div class="wrap" id="app"></div>\n<script>\n"use strict";\nvar DEMO=__DEMO__,HOSTED=__HOSTED__;\nvar $=function(s,r){return (r||document).querySelector(s)};\nvar app=$("#app");\nvar S={holdings:[],orders:[],bundles:{},errors:{},loading:{},tab:"overview",newsFilter:"all",newsSym:"all",newsMore:15,range:252,pick:null,ready:false,updated:null};\n\n/* ---------- formatting ---------- */\nfunction esc(s){return String(s==null?"":s).replace(/[&<>"\']/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;",\'"\':"&quot;","\'":"&#39;"}[c]})}\nvar CUR={INR:"₹",USD:"$",EUR:"€",GBP:"£",SAR:"SAR ",JPY:"¥"};\nfunction cs(c){return CUR[c]!=null?CUR[c]:(c?c+" ":"")}\nfunction nf(v,d){return Number(v).toLocaleString("en-IN",{minimumFractionDigits:d||0,maximumFractionDigits:d||0})}\nfunction money(v,c,d){return v==null?"–":cs(c)+nf(v,d==null?2:d)}\nfunction sgn(v,d){return v==null?"–":(v>=0?"+":"−")+nf(Math.abs(v),d||0)}\nfunction pct(v,d,sign){return v==null?"–":(sign&&v>=0?"+":v<0?"−":"")+Math.abs(v).toFixed(d==null?1:d)+"%"}\nfunction big(v,c){\n  if(v==null)return "–";var a=Math.abs(v),s=v<0?"−":"",p=cs(c);\n  if(c==="INR"){if(a>=1e12)return s+p+(a/1e12).toFixed(2)+" L Cr";if(a>=1e7)return s+p+nf(a/1e7,0)+" Cr";return s+p+nf(a,0)}\n  if(a>=1e12)return s+p+(a/1e12).toFixed(2)+"T";if(a>=1e9)return s+p+(a/1e9).toFixed(2)+"B";if(a>=1e6)return s+p+(a/1e6).toFixed(1)+"M";return s+p+nf(a,0);\n}\nfunction cls(v){return v>=0?"up":"dn"}\nvar LBL={pos:"▲ Positive",neg:"▼ Negative",neu:"● Neutral"};\nfunction pill(k,t){return \'<span class="pill \'+k+\'">\'+esc(t||LBL[k])+\'</span>\'}\nfunction ago(ts){var s=Date.now()/1000-ts;if(!ts)return "";if(s<3600)return Math.max(1,Math.round(s/60))+" min ago";if(s<86400)return Math.round(s/3600)+" h ago";return Math.round(s/86400)+" d ago"}\nfunction dstr(ts){return ts?new Date(ts*1000).toLocaleString("en-GB",{day:"numeric",month:"short",year:"numeric",hour:"2-digit",minute:"2-digit"}):""}\nfunction dday(ts){return ts?new Date(ts*1000).toLocaleDateString("en-GB",{day:"numeric",month:"short",year:"numeric"}):"–"}\nfunction short(sym){return sym.replace(/\\.(NS|BO)$/,"")}\n\n/* ---------- api ---------- */\nfunction api(url,opt){return fetch(url,opt).then(function(r){return r.json().then(function(j){if(!r.ok)throw new Error(j.error||r.status);return j})})}\nfunction saveP(){if(HOSTED){try{localStorage.setItem("sd_portfolio",JSON.stringify({holdings:S.holdings,orders:S.orders}))}catch(e){}return}api("/api/portfolio",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({holdings:S.holdings,orders:S.orders})}).catch(function(){})}\nfunction load(sym,force){\n  S.loading[sym]=true;delete S.errors[sym];\n  return api("/api/stock?symbol="+encodeURIComponent(sym)+(force?"&force=1":"")).then(function(b){S.bundles[sym]=b;S.updated=Date.now()}).catch(function(e){S.errors[sym]=e.message}).then(function(){delete S.loading[sym];refresh(sym)});\n}\n\n/* ---------- technical engine ---------- */\nfunction sma(a,n){var o=[],s=0;for(var i=0;i<a.length;i++){s+=a[i];if(i>=n)s-=a[i-n];o.push(i>=n-1?s/n:null)}return o}\nfunction ema(a,n){var k=2/(n+1),o=[a[0]];for(var i=1;i<a.length;i++)o.push(a[i]*k+o[i-1]*(1-k));return o}\nfunction rsiS(c,n){var o=new Array(c.length).fill(null);if(c.length<=n)return o;var g=0,l=0,i;\n  for(i=1;i<=n;i++){var d=c[i]-c[i-1];if(d>0)g+=d;else l-=d}g/=n;l/=n;o[n]=l===0?100:100-100/(1+g/l);\n  for(i=n+1;i<c.length;i++){var d2=c[i]-c[i-1];g=(g*(n-1)+(d2>0?d2:0))/n;l=(l*(n-1)+(d2<0?-d2:0))/n;o[i]=l===0?100:100-100/(1+g/l)}return o}\nfunction last(a){return a[a.length-1]}\nfunction tech(b){\n  var H=b.history,c=H.c,n=c.length;if(n<60)return null;\n  var px=last(c),s20=sma(c,20),s50=sma(c,50),s200=sma(c,200),r=rsiS(c,14);\n  var e12=ema(c,12),e26=ema(c,26),ml=e12.map(function(v,i){return v-e26[i]}),sg=ema(ml,9);\n  var macd=last(ml),msig=last(sg),mprev=ml[n-2]-sg[n-2];\n  var w=c.slice(-20),mean=w.reduce(function(a,x){return a+x},0)/20,sd=Math.sqrt(w.reduce(function(a,x){return a+Math.pow(x-mean,2)},0)/20),bu=mean+2*sd,bl=mean-2*sd;\n  var hh=Math.max.apply(null,H.h.slice(-14)),ll=Math.min.apply(null,H.l.slice(-14)),K=hh===ll?50:(px-ll)/(hh-ll)*100;\n  var Ks=[];for(var i=n-3;i<n;i++){var a1=Math.max.apply(null,H.h.slice(i-13,i+1)),b1=Math.min.apply(null,H.l.slice(i-13,i+1));Ks.push(a1===b1?50:(c[i]-b1)/(a1-b1)*100)}\n  var D=Ks.reduce(function(a,x){return a+x},0)/3;\n  var tr=[];for(i=1;i<n;i++)tr.push(Math.max(H.h[i]-H.l[i],Math.abs(H.h[i]-c[i-1]),Math.abs(H.l[i]-c[i-1])));\n  var atr=tr.slice(0,14).reduce(function(a,x){return a+x},0)/14;for(i=14;i<tr.length;i++)atr=(atr*13+tr[i])/14;\n  var vAvg=H.v.slice(-21,-1).reduce(function(a,x){return a+x},0)/20,vLast=last(H.v);\n  var ret=function(k){return n>k?(px/c[n-1-k]-1)*100:null};\n  var hi=b.w52High||Math.max.apply(null,c.slice(-252)),lo=b.w52Low||Math.min.apply(null,c.slice(-252)),pos52=hi===lo?50:(px-lo)/(hi-lo)*100;\n  /* swing support / resistance */\n  var sup=[],res=[],sl=H.l.slice(-120),sh=H.h.slice(-120);\n  for(i=5;i<sl.length-5;i++){var isL=true,isH=true;for(var j=i-5;j<=i+5;j++){if(sl[j]<sl[i])isL=false;if(sh[j]>sh[i])isH=false}if(isL)sup.push(sl[i]);if(isH)res.push(sh[i])}\n  var S1=sup.filter(function(x){return x<px}).sort(function(a,b){return b-a})[0]||Math.min.apply(null,H.l.slice(-60));\n  var R1=res.filter(function(x){return x>px}).sort(function(a,b){return a-b})[0]||Math.max.apply(null,H.h.slice(-60));\n  var P=(H.h[n-1]+H.l[n-1]+c[n-1])/3;\n  var cross=null,s50l=last(s50),s200l=last(s200);\n  if(s200l!=null){for(i=n-1;i>=Math.max(200,n-90);i--){var a2=s50[i]>s200[i],b2=s50[i-1]>s200[i-1];if(a2!==b2){cross={golden:a2,ago:n-1-i};break}}}\n  var rows=[];\n  function add(label,val,k,txt,why){rows.push({label:label,val:val,k:k,txt:txt,why:why})}\n  add("Price vs 20-day average",nf(last(s20),2),px>last(s20)?"pos":"neg",px>last(s20)?"Above":"Below","Short-term trend. Above the average means buyers are in control over the last month.");\n  add("Price vs 50-day average",nf(s50l,2),px>s50l?"pos":"neg",px>s50l?"Above":"Below","Medium-term trend (about 2.5 months).");\n  if(s200l!=null)add("Price vs 200-day average",nf(s200l,2),px>s200l?"pos":"neg",px>s200l?"Above":"Below","Long-term trend. Stocks above it are generally in an uptrend.");\n  if(s200l!=null)add("50/200-day crossover",s50l>s200l?"50 above 200":"50 below 200",s50l>s200l?"pos":"neg",s50l>s200l?(cross?"Golden cross "+cross.ago+"d ago":"Bullish"):(cross?"Death cross "+cross.ago+"d ago":"Bearish"),"When the 50-day average crosses above the 200-day it is called a golden cross (bullish). Below is a death cross (bearish).");\n  var rv=last(r);add("RSI (14)",rv.toFixed(1),rv>70?"neg":rv<30?"pos":rv>=50?"pos":"neu",rv>70?"Overbought":rv<30?"Oversold (bounce chance)":rv>=50?"Bullish momentum":"Weak momentum","Momentum gauge from 0 to 100. Above 70 can mean overheated, below 30 can mean oversold.");\n  add("MACD (12,26,9)",macd.toFixed(2)+" / "+msig.toFixed(2),macd>msig?"pos":"neg",macd>msig?(mprev<=0?"Fresh bullish cross":"Bullish"):(mprev>=0?"Fresh bearish cross":"Bearish"),"Compares two moving averages. MACD above its signal line suggests rising momentum.");\n  add("Stochastic (14,3)",K.toFixed(0)+" / "+D.toFixed(0),K>80?"neg":K<20?"pos":K>D?"pos":"neg",K>80?"Overbought":K<20?"Oversold":K>D?"Rising":"Falling","Shows where the close sits inside the last 14 days\' range. Above 80 is stretched, below 20 is washed out.");\n  add("Bollinger bands (20,2)",nf(bl,0)+" – "+nf(bu,0),px>bu?"neg":px<bl?"pos":"neu",px>bu?"Above upper band":px<bl?"Below lower band":"Inside bands","Price outside the bands is statistically stretched and often snaps back.");\n  var vr=vAvg?vLast/vAvg:1,up=px>=c[n-2];\n  add("Volume vs 20-day average",vr.toFixed(2)+"x",vr>1.3?(up?"pos":"neg"):"neu",vr>1.3?(up?"High volume rise":"High volume fall"):vr<0.7?"Quiet":"Normal","A move on heavy volume is more believable than one on thin volume.");\n  add("Volatility (ATR 14)",nf(atr,2)+" ("+(atr/px*100).toFixed(1)+"%)","neu",atr/px>0.03?"High":atr/px>0.017?"Moderate":"Low","Average daily swing. Helps you size positions and place stop-losses.");\n  add("Position in 52-week range",pos52.toFixed(0)+"%",pos52>=70?"pos":pos52<=25?"neg":"neu",pos52>=70?"Near highs":pos52<=25?"Near lows":"Mid-range","0% is the 52-week low and 100% is the high.");\n  var ps=rows.filter(function(x){return x.k==="pos"}).length,ng=rows.filter(function(x){return x.k==="neg"}).length,score=ps-ng;\n  return{rows:rows,score:score,pos:ps,neg:ng,k:score>=3?"pos":score<=-3?"neg":"neu",txt:score>=3?"Bullish":score<=-3?"Bearish":"Neutral",\n    s20:s20,s50:s50,s200:s200,rsi:r,levels:{S1:S1,R1:R1,P:P,S1p:2*P-H.h[n-1],R1p:2*P-H.l[n-1]},ret:[["1 week",ret(5)],["1 month",ret(21)],["3 months",ret(63)],["6 months",ret(126)],["1 year",ret(251)]]};\n}\nfunction techOf(b){if(!b)return null;if(b._t===undefined)b._t=tech(b);return b._t}\n\n/* ---------- fundamental engine ---------- */\nfunction isBank(b){var i=(b.profile&&b.profile.industry)||"";return /bank|capital markets|insurance|credit services|mortgage|asset management/i.test(i)}\nvar BANK="Not meaningful for banks and lenders";\nvar M=[\n{g:"Valuation",label:"P/E ratio (trailing)",get:function(d){return d.trailingPE},fmt:function(x){return x.toFixed(1)+"x"},rule:function(x){return x<=0?"neg":x<15?"pos":x<=30?"neu":"neg"},th:"Good under 15, fair 15–30, expensive over 30",why:"Years of current profit you pay for the stock. Lower is cheaper, but compare with others in the same sector."},\n{g:"Valuation",label:"P/E ratio (forward)",get:function(d){return d.forwardPE},fmt:function(x){return x.toFixed(1)+"x"},rule:function(x){return x<=0?"neg":x<=20?"pos":x<=35?"neu":"neg"},th:"Good under 20, fair 20–35, expensive over 35",why:"Same as P/E but on expected next-year profit. Lower than trailing P/E means profit is expected to grow."},\n{g:"Valuation",label:"Price / Book",get:function(d){return d.priceToBook},fmt:function(x){return x.toFixed(2)+"x"},rule:function(x){return x<=3?"pos":x<=6?"neu":"neg"},th:"Good under 3, fair 3–6, rich over 6",why:"Price compared with the accounting value of the company\'s assets after debts. Key for banks."},\n{g:"Valuation",label:"Price / Sales",get:function(d){return d.priceToSalesTrailing12Months},fmt:function(x){return x.toFixed(2)+"x"},rule:function(x){return x<=2?"pos":x<=6?"neu":"neg"},th:"Good under 2, fair 2–6, rich over 6",why:"Price for each ₹1 of yearly sales. Useful when profit is small or volatile."},\n{g:"Valuation",label:"EV / EBITDA",skip:1,get:function(d){return d.enterpriseToEbitda},fmt:function(x){return x.toFixed(1)+"x"},rule:function(x){return x<=0?"neg":x<=10?"pos":x<=20?"neu":"neg"},th:"Good under 10, fair 10–20, rich over 20",why:"Price of the whole business (debt included) against operating earnings. Not distorted by debt levels."},\n{g:"Valuation",label:"PEG ratio",get:function(d){return d.pegRatio},fmt:function(x){return x.toFixed(2)},rule:function(x){return x<=0?"neu":x<=1?"pos":x<=2?"neu":"neg"},th:"Good under 1, fair 1–2, expensive over 2",why:"P/E divided by expected growth. Under 1 means growth is cheap at this price."},\n{g:"Profitability",label:"Net profit margin",get:function(d){return d.profitMargins!=null?d.profitMargins*100:null},fmt:function(x){return x.toFixed(1)+"%"},rule:function(x){return x>=15?"pos":x>=7?"neu":"neg"},th:"Good 15%+, fair 7–15%, weak under 7%",why:"Profit kept from each ₹100 of sales after all costs and tax."},\n{g:"Profitability",label:"Operating margin",get:function(d){return d.operatingMargins!=null?d.operatingMargins*100:null},fmt:function(x){return x.toFixed(1)+"%"},rule:function(x){return x>=20?"pos":x>=10?"neu":"neg"},th:"Good 20%+, fair 10–20%, weak under 10%",why:"Profit from core operations before interest and tax."},\n{g:"Profitability",label:"Gross margin",skip:1,get:function(d){return d.grossMargins!=null?d.grossMargins*100:null},fmt:function(x){return x.toFixed(1)+"%"},rule:function(x){return x>=40?"pos":x>=20?"neu":"neg"},th:"Good 40%+, fair 20–40%, weak under 20%",why:"Sales left after direct production costs. Shows pricing power."},\n{g:"Profitability",label:"Return on equity (ROE)",get:function(d){return d.returnOnEquity!=null?d.returnOnEquity*100:null},fmt:function(x){return x.toFixed(1)+"%"},rule:function(x){return x>=15?"pos":x>=8?"neu":"neg"},th:"Good 15%+, fair 8–15%, weak under 8%",why:"Profit earned on shareholders\' money. Higher means management uses capital well."},\n{g:"Profitability",label:"Return on assets (ROA)",get:function(d){return d.returnOnAssets!=null?d.returnOnAssets*100:null},fmt:function(x){return x.toFixed(2)+"%"},rule:function(x,c){return c.bank?(x>=1.2?"pos":x>=0.7?"neu":"neg"):(x>=7?"pos":x>=3?"neu":"neg")},th:"Good 7%+ (banks 1.2%+), fair 3–7% (banks 0.7–1.2%)",why:"Profit earned on everything the company owns."},\n{g:"Growth",label:"Revenue growth (latest quarter, YoY)",get:function(d){return d.revenueGrowth!=null?d.revenueGrowth*100:null},fmt:function(x){return pct(x,1,true)},rule:function(x){return x>=10?"pos":x>=3?"neu":"neg"},th:"Good 10%+, fair 3–10%, weak under 3%",why:"How much faster sales are growing than a year ago."},\n{g:"Growth",label:"Earnings growth (YoY)",get:function(d){return d.earningsGrowth!=null?d.earningsGrowth*100:d.earningsQuarterlyGrowth!=null?d.earningsQuarterlyGrowth*100:null},fmt:function(x){return pct(x,1,true)},rule:function(x){return x>=10?"pos":x>=0?"neu":"neg"},th:"Good 10%+, fair 0–10%, weak if negative",why:"How much faster profit is growing than a year ago."},\n{g:"Growth",label:"Expected EPS growth (next year)",get:function(d){return d.forwardEps!=null&&d.trailingEps>0?(d.forwardEps/d.trailingEps-1)*100:null},fmt:function(x){return pct(x,1,true)},rule:function(x){return x>=10?"pos":x>=0?"neu":"neg"},th:"Good 10%+, fair 0–10%, weak if negative",why:"What analysts expect for earnings per share compared with the last 12 months."},\n{g:"Financial health",label:"Debt / Equity",skip:1,get:function(d){return d.debtToEquity!=null?d.debtToEquity/100:null},fmt:function(x){return x.toFixed(2)+"x"},rule:function(x){return x<=0.5?"pos":x<=1.5?"neu":"neg"},th:"Good under 0.5, fair 0.5–1.5, risky over 1.5",why:"How much borrowed money the company uses against its own. High debt hurts when profits dip."},\n{g:"Financial health",label:"Current ratio",skip:1,get:function(d){return d.currentRatio},fmt:function(x){return x.toFixed(2)},rule:function(x){return x>=1.5?"pos":x>=1?"neu":"neg"},th:"Good 1.5+, fair 1–1.5, weak under 1",why:"Short-term assets against short-term bills. Under 1 can mean cash-flow strain."},\n{g:"Financial health",label:"Quick ratio",skip:1,get:function(d){return d.quickRatio},fmt:function(x){return x.toFixed(2)},rule:function(x){return x>=1?"pos":x>=0.7?"neu":"neg"},th:"Good 1+, fair 0.7–1, weak under 0.7",why:"Like current ratio but ignores inventory, so it is a stricter test."},\n{g:"Financial health",label:"Cash vs total debt",skip:1,get:function(d){return d.totalCash!=null&&d.totalDebt>0?d.totalCash/d.totalDebt:d.totalCash!=null&&d.totalDebt===0?9:null},fmt:function(x,d,b){return x>=9?"Debt-free":(x*100).toFixed(0)+"% covered"},rule:function(x){return x>=1?"pos":x>=0.3?"neu":"neg"},th:"Good if cash covers all debt, fair 30–100%, weak under 30%",why:"How much of the debt could be repaid from cash on hand today."},\n{g:"Financial health",label:"Free cash flow",skip:1,get:function(d){return d.freeCashflow},fmt:function(x,d,b){return big(x,b.currency)},rule:function(x){return x>0?"pos":"neg"},th:"Good if positive",why:"Cash left after running the business and investing in it. Funds dividends and growth."},\n{g:"Financial health",label:"Operating cash flow",skip:1,get:function(d){return d.operatingCashflow},fmt:function(x,d,b){return big(x,b.currency)},rule:function(x){return x>0?"pos":"neg"},th:"Good if positive",why:"Cash generated by the core business. Should be steady and positive."},\n{g:"Dividends",label:"Dividend yield",get:function(d){var y=d.dividendYield;return y==null?null:(y<=0.3?y*100:y)},fmt:function(x){return x===0?"No dividend":x.toFixed(2)+"%"},rule:function(x){return x>=2?"pos":"neu"},th:"Good 2%+, otherwise neutral",why:"Yearly dividend as a share of the price. Growth companies often pay little."},\n{g:"Dividends",label:"Payout ratio",get:function(d){return d.payoutRatio!=null?d.payoutRatio*100:null},fmt:function(x){return x.toFixed(0)+"%"},rule:function(x){return x===0?"neu":x<=60?"pos":x<=90?"neu":"neg"},th:"Good under 60%, fair 60–90%, stretched over 90%",why:"Share of profit paid out as dividends. Very high payouts are hard to sustain."},\n{g:"Ownership & analysts",label:"Promoter / insider holding",get:function(d){return d.heldPercentInsiders!=null?d.heldPercentInsiders*100:null},fmt:function(x){return x.toFixed(1)+"%"},rule:function(x){return x>=45?"pos":"neu"},th:"Good 45%+, otherwise neutral",why:"Owners with large stakes tend to be aligned with shareholders."},\n{g:"Ownership & analysts",label:"Institutional holding",get:function(d){return d.heldPercentInstitutions!=null?d.heldPercentInstitutions*100:null},fmt:function(x){return x.toFixed(1)+"%"},rule:function(x){return x>=20?"pos":"neu"},th:"Good 20%+, otherwise neutral",why:"Funds and institutions doing their own research and holding the stock."},\n{g:"Ownership & analysts",label:"Analyst rating (1 = strong buy, 5 = sell)",get:function(d){return d.recommendationMean},fmt:function(x,d){return x.toFixed(1)+(d.numberOfAnalystOpinions?" ("+d.numberOfAnalystOpinions+" analysts)":"")},rule:function(x){return x<=2.2?"pos":x<=3?"neu":"neg"},th:"Good 2.2 or lower, fair up to 3, weak above 3",why:"Average recommendation of brokerage analysts covering the stock."},\n{g:"Ownership & analysts",label:"Upside to analyst target price",get:function(d,b){return d.targetMeanPrice!=null&&b.price?(d.targetMeanPrice/b.price-1)*100:null},fmt:function(x,d,b){return pct(x,1,true)+" (target "+money(d.targetMeanPrice,b.currency,0)+")"},rule:function(x){return x>=10?"pos":x>=0?"neu":"neg"},th:"Good 10%+, fair 0–10%, weak if below price",why:"Gap between today\'s price and the average analyst target."},\n{g:"Ownership & analysts",label:"Beta (volatility vs market)",get:function(d){return d.beta},fmt:function(x){return x.toFixed(2)},rule:function(x){return x<=1?"pos":x<=1.4?"neu":"neg"},th:"Calm 1 or lower, fair up to 1.4, volatile above 1.4",why:"How strongly the stock swings compared with the market. Above 1 moves more."}\n];\nvar GROUPS=["Valuation","Profitability","Growth","Financial health","Dividends","Ownership & analysts"];\nfunction mScore(list){var r=list.filter(function(x){return x.k==="pos"||x.k==="neu"||x.k==="neg"});if(!r.length)return null;\n  var s=r.reduce(function(a,x){return a+(x.k==="pos"?1:x.k==="neu"?.5:0)},0)/r.length;return{s:s,k:s>=.65?"pos":s>=.45?"neu":"neg",txt:s>=.65?"Strong":s>=.45?"Average":"Weak",n:r.length,p:r.filter(function(x){return x.k==="pos"}).length,g:r.filter(function(x){return x.k==="neg"}).length}}\nfunction fundOf(b){\n  if(b._f)return b._f;var d=b.fund||{},bank=isBank(b),ctx={bank:bank},rows=[];\n  M.forEach(function(m){var v=null;try{v=m.get(d,b)}catch(e){}\n    var row={g:m.g,label:m.label,th:m.th,why:m.why,raw:v};\n    if(m.skip&&bank){row.k="na";row.val=BANK}\n    else if(v==null||isNaN(v)){row.k="na";row.val="Not available"}\n    else{row.k=m.rule(v,ctx);row.val=m.fmt(v,d,b)}\n    rows.push(row)});\n  var groups=GROUPS.map(function(g){var l=rows.filter(function(x){return x.g===g});return{g:g,rows:l,sc:mScore(l)}});\n  b._f={rows:rows,groups:groups,all:mScore(rows),bank:bank};return b._f;\n}\n\n/* ---------- shared helpers ---------- */\nfunction holding(sym){return S.holdings.filter(function(h){return h.symbol===sym})[0]}\nfunction mood(b){return b?b.newsSummary.label:"neu"}\nfunction fundPill(b){var f=fundOf(b);return f.all?pill(f.all.k,(f.all.k==="pos"?"▲ ":f.all.k==="neg"?"▼ ":"● ")+f.all.txt):pill("na","n/a")}\nfunction techPill(b){var t=techOf(b);return t?pill(t.k,(t.k==="pos"?"▲ ":t.k==="neg"?"▼ ":"● ")+t.txt):pill("na","n/a")}\nfunction lastEarn(b){var h=b.earnings&&b.earnings.history;return h&&h.length?h[h.length-1]:null}\nfunction earnPill(e){if(!e||e.surprisePct==null)return pill("na","n/a");var s=e.surprisePct;return s>1?pill("pos","▲ Beat "+pct(s,1,true)):s<-1?pill("neg","▼ Miss "+pct(s,1,true)):pill("neu","● In line")}\nfunction qlabel(ts){if(!ts)return "–";var d=new Date(ts*1000);return "Q"+(Math.floor(d.getUTCMonth()/3)+1)+" "+d.getUTCFullYear()}\nfunction newsRow(n,sym,showSym){\n  var why=(n.reasons||[]).map(function(r){return esc(r.label)+" ("+(r.weight>0?"+":"")+r.weight+")"}).join(", ");\n  return \'<div class="ni"><div class="meta">\'+(showSym?\'<a href="#/s/\'+encodeURIComponent(sym)+\'" class="mono" style="font-weight:600;text-decoration:none">\'+esc(short(sym))+\'</a>\':\'\')+pill(n.sentiment)+\'<span class="chip">\'+esc(n.category)+\'</span><span>\'+esc(n.source)+\' · \'+ago(n.ts)+(n.ts?\' · \'+dstr(n.ts):\'\')+\'</span></div>\'+\n   \'<div class="t"><a href="\'+esc(n.link)+\'" target="_blank" rel="noopener noreferrer">\'+esc(n.title)+\'</a></div>\'+\n   (n.summary?\'<div class="sm">\'+esc(n.summary)+\'</div>\':\'\')+\n   \'<div class="why">\'+(why?\'Why \'+(n.sentiment==="pos"?"positive":n.sentiment==="neg"?"negative":"neutral")+\': \'+why:\'No strong positive or negative wording found, so it is tagged neutral.\')+\' · <a href="\'+esc(n.link)+\'" target="_blank" rel="noopener noreferrer">Read full article ↗</a></div></div>\';\n}\n\n/* ---------- routing ---------- */\nfunction route(){var h=location.hash||"#/";var m=h.match(/^#\\/s\\/(.+)$/);return m?{name:"stock",sym:decodeURIComponent(m[1])}:{name:"home"}}\nvar built=null;\nfunction refresh(from){var r=route();if(from&&r.name==="stock"&&from!==r.sym)return;if(r.name==="home"){if(built!=="home")buildHome();updateHome()}else{buildStock(r.sym)}}\nwindow.addEventListener("hashchange",function(){built=null;S.tab="overview";S.newsMore=15;refresh();window.scrollTo(0,0)});\n\n/* ---------- home ---------- */\nfunction buildHome(){\n  built="home";\n  app.innerHTML=\'<header class="top"><div><h1>Stock Desk</h1><div class="sub" id="upd">Your portfolio, live news, results and analysis</div></div><div class="chips"><button id="refreshAll">↻ Refresh all</button></div></header>\'+\n   (DEMO?\'<div class="demo">DEMO MODE: all prices, news and numbers are made up for trying the app. Start without --demo for live data.</div>\':\'\')+\n   \'<div class="tiles" id="tiles"></div>\'+\n   \'<section class="card"><div class="card-h"><h2>Add a stock</h2><span class="sub">Search any company or ticker (NSE, BSE or global). Leave quantity empty to just watch it.</span></div>\'+\n   \'<form class="addbar" id="addf" autocomplete="off"><div class="searchbox"><label for="q">Company or ticker<input id="q" type="text" placeholder="e.g. Tata Motors, RELIANCE, AAPL" style="text-transform:none"></label><div class="results" id="res" hidden></div></div>\'+\n   \'<label>Quantity<input class="s" id="aq" type="number" min="0" step="any" placeholder="0"></label><label>Avg buy price<input class="s" id="aa" type="number" min="0" step="any" placeholder="optional"></label><button class="primary" type="submit" id="addbtn">Add stock</button><span class="sub" id="addmsg" role="status"></span></form></section>\'+\n   \'<div class="grid2"><section class="card"><div class="card-h"><h2>Holdings</h2><span class="sub">Click a stock for full analysis</span></div><div class="scroll" id="hold"></div></section>\'+\n   \'<section class="card"><div class="card-h"><h2>Latest news</h2><div class="chips" id="nfilters"></div></div><div class="news" id="newsfeed"></div></section></div>\'+\n   \'<div class="grid2"><section class="card"><div class="card-h"><h2>Earnings and results</h2></div><div class="scroll" id="earn"></div></section>\'+\n   \'<section class="card"><div class="card-h"><h2>Orders</h2></div><form class="addbar" id="ordf"><label>Stock<select id="osym"></select></label><label>Side<select id="oside"><option>BUY</option><option>SELL</option></select></label><label>Type<select id="otype"><option>Limit</option><option>Market</option><option>Stop-loss</option></select></label><label>Qty<input class="s" id="oqty" type="number" min="1" step="any" required style="width:80px"></label><label>Price<input class="s" id="opx" type="number" min="0" step="any" style="width:90px"></label><button class="primary" type="submit">Log order</button></form><div class="scroll" id="orders" style="margin-top:10px"></div><p class="note">Orders are kept here as your own log. Mark them executed or cancelled as they happen at your broker.</p></section></div>\'+\n   \'<p class="note">Data from Yahoo Finance and news sites, shown for information only. Positive and negative tags come from wording in headlines, so read the article before acting. This is not investment advice.</p>\';\n  wireHome();\n}\nfunction wireHome(){\n  var q=$("#q"),res=$("#res"),timer;\n  q.addEventListener("input",function(){S.pick=null;clearTimeout(timer);var v=q.value.trim();if(v.length<2){res.hidden=true;return}\n    timer=setTimeout(function(){api("/api/search?q="+encodeURIComponent(v)).then(function(r){\n      res.innerHTML=r.length?r.map(function(x,i){return\'<button type="button" data-pick="\'+i+\'"><span><b>\'+esc(short(x.symbol))+\'</b> \'+esc(x.name)+\'</span><span class="sub">\'+esc(x.exchange||"")+\'</span></button>\'}).join(""):\'<div class="sub" style="padding:10px">No match. Try the ticker, like RELIANCE or AAPL.</div>\';\n      res._r=r;res.hidden=false}).catch(function(e){res.innerHTML=\'<div class="err" style="padding:10px">Search failed: \'+esc(e.message)+\'</div>\';res.hidden=false})},250)});\n  res.addEventListener("click",function(e){var b=e.target.closest("[data-pick]");if(!b)return;S.pick=res._r[+b.dataset.pick];q.value=S.pick.name+" ("+S.pick.symbol+")";res.hidden=true});\n  $("#addf").addEventListener("submit",function(e){e.preventDefault();var msg=$("#addmsg");msg.textContent="";\n    function go(p){var qty=parseFloat($("#aq").value)||0,avg=parseFloat($("#aa").value)||0,ex=holding(p.symbol);\n      if(ex){ex.qty=qty||ex.qty;ex.avg=avg||ex.avg}else S.holdings.push({symbol:p.symbol,qty:qty,avg:avg});\n      saveP();$("#addf").reset();S.pick=null;msg.textContent="Added "+p.symbol;load(p.symbol,true).then(function(){var b=S.bundles[p.symbol],h=holding(p.symbol);if(b&&h&&!h.avg){h.avg=b.price;saveP();refresh()}});refresh()}\n    if(S.pick)return go(S.pick);\n    var v=q.value.trim();if(!v){msg.textContent="Type a company or ticker first.";return}\n    msg.textContent="Searching…";api("/api/search?q="+encodeURIComponent(v)).then(function(r){if(!r.length){msg.textContent="No stock found for "+v;return}go(r[0])}).catch(function(er){msg.textContent="Search failed: "+er.message})});\n  $("#refreshAll").onclick=function(){S.holdings.forEach(function(h){load(h.symbol,true)})};\n  $("#ordf").addEventListener("submit",function(e){e.preventDefault();var sym=$("#osym").value;if(!sym)return;\n    S.orders.unshift({id:String(Date.now()),symbol:sym,side:$("#oside").value,type:$("#otype").value,qty:parseFloat($("#oqty").value)||0,price:parseFloat($("#opx").value)||0,status:"Open",date:new Date().toLocaleDateString("en-GB",{day:"numeric",month:"short"})});\n    saveP();$("#oqty").value="";$("#opx").value="";refresh()});\n}\nfunction homeClicks(e){\n  var t=e.target,b;\n  if((b=t.closest("[data-rm]"))){S.holdings=S.holdings.filter(function(h){return h.symbol!==b.dataset.rm});saveP();refresh();return}\n  if((b=t.closest("[data-nf]"))){S.newsFilter=b.dataset.nf;S.newsMore=15;refresh();return}\n  if((b=t.closest("[data-more]"))){S.newsMore+=15;refresh();return}\n  if((b=t.closest("[data-retry]"))){load(b.dataset.retry,true);refresh();return}\n  if((b=t.closest("[data-ost]"))){var o=S.orders.filter(function(x){return x.id===b.dataset.oid})[0];if(o){o.status=b.dataset.ost;saveP();refresh()}return}\n  if((b=t.closest("[data-odel]"))){S.orders=S.orders.filter(function(x){return x.id!==b.dataset.odel});saveP();refresh();return}\n  if((b=t.closest("tr[data-go]"))){location.hash="#/s/"+encodeURIComponent(b.dataset.go)}\n}\napp.addEventListener("click",function(e){if(route().name==="home")homeClicks(e)});\ndocument.addEventListener("click",function(e){var r=$("#res");if(r&&!e.target.closest(".searchbox"))r.hidden=true});\napp.addEventListener("keydown",function(e){if(e.key==="Enter"){var r=e.target.closest&&e.target.closest("tr[data-go]");if(r)location.hash="#/s/"+encodeURIComponent(r.dataset.go)}});\nfunction updateHome(){\n  var hs=S.holdings,bs=hs.map(function(h){return S.bundles[h.symbol]}),base=null;\n  bs.forEach(function(b){if(b&&!base)base=b.currency});\n  var inv=0,val=0,day=0,mixed=false,pos=0,neg=0,cnt=0;\n  hs.forEach(function(h){var b=S.bundles[h.symbol];if(!b)return;if(b.currency!==base){mixed=true;return}\n    if(h.qty>0){inv+=h.qty*(h.avg||b.price);val+=h.qty*b.price;day+=h.qty*b.change}});\n  bs.forEach(function(b){if(b){pos+=b.newsSummary.pos;neg+=b.newsSummary.neg;cnt++}});\n  var pl=val-inv,mk=pos>neg*1.3?"pos":neg>pos*1.3?"neg":"neu";\n  $("#tiles").innerHTML=[["Current value",money(val,base,0)],["Invested",money(inv,base,0)],["Today\'s P&amp;L",\'<span class="\'+cls(day)+\'">\'+sgn(day)+\'</span>\'],\n   ["Total P&amp;L",\'<span class="\'+cls(pl)+\'">\'+sgn(pl)+(inv?" ("+pct(pl/inv*100,1,true)+")":"")+\'</span>\'],\n   ["News mood",pill(mk)+\' <span class="sub">\'+pos+\' pos · \'+neg+\' neg</span>\']].map(function(t){return\'<div class="tile"><div class="l">\'+t[0]+\'</div><div class="v">\'+t[1]+\'</div></div>\'}).join("")+(mixed?\'<div class="tile"><div class="l">Note</div><div class="sub">Totals include \'+esc(base)+\' stocks only</div></div>\':"");\n  $("#upd").textContent=S.updated?"Updated "+new Date(S.updated).toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit"})+" · data refreshes every 5 minutes":"Loading your stocks…";\n  /* holdings */\n  if(!hs.length){$("#hold").innerHTML=\'<p class="loading">No stocks yet. Search for a company above and click Add stock.</p>\'}\n  else{var h=\'<table style="min-width:780px"><thead><tr><th>Stock</th><th class="n">Qty</th><th class="n">Avg</th><th class="n">Price</th><th class="n">Day</th><th class="n">P&amp;L</th><th>News</th><th>Fundamentals</th><th>Technicals</th><th></th></tr></thead><tbody>\';\n    hs.forEach(function(x){var b=S.bundles[x.symbol];\n      if(!b){h+=\'<tr><td class="sym">\'+esc(short(x.symbol))+\'</td><td colspan="8" class="\'+(S.errors[x.symbol]?"err":"sub")+\'">\'+(S.errors[x.symbol]?esc(S.errors[x.symbol])+\' <button class="link" data-retry="\'+esc(x.symbol)+\'">Retry</button>\':"Loading…")+\'</td><td><button class="link" data-rm="\'+esc(x.symbol)+\'" aria-label="Remove">✕</button></td></tr>\';return}\n      var pl=x.qty>0?x.qty*(b.price-(x.avg||b.price)):null;\n      h+=\'<tr class="row" tabindex="0" data-go="\'+esc(x.symbol)+\'"><td><div class="sym">\'+esc(short(x.symbol))+\'</div><div class="sub">\'+esc(b.name)+\'</div></td><td class="n">\'+(x.qty>0?nf(x.qty,0):\'<span class="sub">Watch</span>\')+\'</td><td class="n">\'+(x.avg?money(x.avg,b.currency,2):"–")+\'</td><td class="n">\'+money(b.price,b.currency,2)+\'</td><td class="n \'+cls(b.changePct)+\'">\'+pct(b.changePct,2,true)+\'</td><td class="n \'+(pl==null?"":cls(pl))+\'">\'+(pl==null?"–":sgn(pl))+\'</td><td>\'+pill(mood(b))+\'</td><td>\'+fundPill(b)+\'</td><td>\'+techPill(b)+\'</td><td><button class="link" data-rm="\'+esc(x.symbol)+\'" aria-label="Remove \'+esc(x.symbol)+\'">✕</button></td></tr>\'});\n    $("#hold").innerHTML=h+\'</tbody></table>\'}\n  /* news */\n  var syms=hs.map(function(x){return x.symbol});\n  $("#nfilters").innerHTML=[["all","All"],["pos","Positive"],["neg","Negative"]].map(function(f){return\'<button data-nf="\'+f[0]+\'" class="\'+(S.newsFilter===f[0]?"on":"")+\'">\'+f[1]+\'</button>\'}).join("");\n  var items=[];syms.forEach(function(s){var b=S.bundles[s];if(b)b.news.forEach(function(n){items.push({s:s,n:n})})});\n  items=items.filter(function(i){return S.newsFilter==="all"||i.n.sentiment===S.newsFilter}).sort(function(a,b){return b.n.ts-a.n.ts});\n  var shown=items.slice(0,S.newsMore);\n  $("#newsfeed").innerHTML=shown.length?shown.map(function(i){return newsRow(i.n,i.s,true)}).join("")+(items.length>shown.length?\'<button data-more="1" style="margin-top:10px">Show more (\'+(items.length-shown.length)+\')</button>\':""):\'<p class="loading">\'+(cnt?"No news in this filter.":"Loading news…")+\'</p>\';\n  /* earnings */\n  var e=\'<table style="min-width:520px"><thead><tr><th>Stock</th><th>Last quarter</th><th class="n">EPS est.</th><th class="n">EPS actual</th><th>Result</th><th>Next results</th></tr></thead><tbody>\';\n  hs.forEach(function(x){var b=S.bundles[x.symbol];if(!b)return;var l=lastEarn(b),nx=b.earnings.nextDate;\n    e+=\'<tr class="row" tabindex="0" data-go="\'+esc(x.symbol)+\'"><td class="sym">\'+esc(short(x.symbol))+\'</td><td>\'+(l?qlabel(l.quarter):"–")+\'</td><td class="n">\'+(l&&l.epsEstimate!=null?l.epsEstimate.toFixed(2):"–")+\'</td><td class="n">\'+(l?l.epsActual.toFixed(2):"–")+\'</td><td>\'+earnPill(l)+\'</td><td>\'+(nx?dday(nx):\'<span class="sub">Not announced</span>\')+\'</td></tr>\'});\n  $("#earn").innerHTML=hs.length?e+\'</tbody></table>\':\'<p class="loading">Add a stock to see results.</p>\';\n  /* orders */\n  var sel=$("#osym"),keep=sel.value;sel.innerHTML=syms.map(function(s){return\'<option value="\'+esc(s)+\'">\'+esc(short(s))+\'</option>\'}).join("");if(syms.indexOf(keep)>=0)sel.value=keep;\n  var o=S.orders.filter(function(x){return syms.indexOf(x.symbol)>=0});\n  $("#orders").innerHTML=o.length?\'<table style="min-width:480px"><thead><tr><th>Stock</th><th>Side</th><th>Type</th><th class="n">Qty</th><th class="n">Price</th><th>Status</th><th></th></tr></thead><tbody>\'+o.map(function(x){var st={Open:"neu",Executed:"pos",Cancelled:"neg"}[x.status];\n    return\'<tr><td class="sym">\'+esc(short(x.symbol))+\'<div class="sub">\'+esc(x.date)+\'</div></td><td class="\'+(x.side==="BUY"?"up":"dn")+\'">\'+x.side+\'</td><td>\'+esc(x.type)+\'</td><td class="n">\'+nf(x.qty,0)+\'</td><td class="n">\'+(x.price?nf(x.price,2):"Market")+\'</td><td>\'+pill(st,x.status)+\'</td><td>\'+(x.status==="Open"?\'<button class="link" data-oid="\'+x.id+\'" data-ost="Executed">Executed</button><button class="link" data-oid="\'+x.id+\'" data-ost="Cancelled">Cancel</button>\':\'\')+\'<button class="link" data-odel="\'+x.id+\'" aria-label="Delete order">✕</button></td></tr>\'}).join("")+\'</tbody></table>\':\'<p class="sub">No orders logged yet.</p>\';\n}\n\n/* ---------- stock page ---------- */\nfunction buildStock(sym){\n  built="stock";\n  var b=S.bundles[sym];\n  if(!b){\n    if(!S.loading[sym]&&!S.errors[sym])load(sym);\n    app.innerHTML=\'<div><button id="back">← Back to portfolio</button></div>\'+(S.errors[sym]?\'<p class="err">Could not load \'+esc(sym)+\': \'+esc(S.errors[sym])+\'</p><button data-retry="\'+esc(sym)+\'" id="retry">Retry</button>\':\'<p class="loading">Loading \'+esc(sym)+\'…</p>\');\n    $("#back").onclick=function(){location.hash="#/"};var r=$("#retry");if(r)r.onclick=function(){load(sym,true);refresh()};return}\n  var h=holding(sym),t=techOf(b),f=fundOf(b),p=b.profile||{};\n  var o=\'<div><button id="back">← Back to portfolio</button></div>\';\n  if(DEMO)o+=\'<div class="demo">DEMO MODE: made-up data.</div>\';\n  o+=\'<div class="dhead"><div><h1>\'+esc(b.name)+\'</h1><div class="sub mono">\'+esc(b.symbol)+\' · \'+esc(b.exchange||"")+(p.sector?\' · \'+esc(p.sector):\'\')+(p.industry?\' · \'+esc(p.industry):\'\')+\'</div></div><div><div class="px">\'+money(b.price,b.currency,2)+\'</div><div class="mono \'+cls(b.change)+\'">\'+sgn(b.change,2)+\' (\'+pct(b.changePct,2,true)+\') today</div></div></div>\';\n  o+=\'<div class="badges"><span class="sub" style="align-self:center">News</span>\'+pill(mood(b))+\'<span class="sub" style="align-self:center">Fundamentals</span>\'+fundPill(b)+\'<span class="sub" style="align-self:center">Technicals</span>\'+techPill(b)+\'<button id="rf" class="link">↻ Refresh</button></div>\';\n  if(b.warning)o+=\'<p class="err">\'+esc(b.warning)+\'</p>\';\n  o+=\'<div class="tabs" role="tablist">\'+[["overview","Overview"],["fund","Fundamentals"],["tech","Technicals"],["earn","Earnings"],["news","News ("+b.news.length+")"]].map(function(x){return\'<button role="tab" data-tab="\'+x[0]+\'" class="\'+(S.tab===x[0]?"on":"")+\'">\'+x[1]+\'</button>\'}).join("")+\'</div>\';\n  o+=\'<div id="tabbody" style="display:flex;flex-direction:column;gap:18px">\'+tabBody(b,h,t,f)+\'</div>\';\n  o+=\'<p class="note">Fundamentals are rated against simple rules of thumb (shown beside each number). Sector norms differ, so treat ratings as a starting point. Not investment advice.</p>\';\n  app.innerHTML=o;\n  $("#back").onclick=function(){location.hash="#/"};\n  $("#rf").onclick=function(){load(sym,true)};\n  app.querySelectorAll("[data-tab]").forEach(function(x){x.onclick=function(){S.tab=x.dataset.tab;buildStock(sym)}});\n  var fo=$("#nfs");\n  app.querySelectorAll("[data-sf]").forEach(function(x){x.onclick=function(){S.newsFilter=x.dataset.sf;buildStock(sym)}});\n  app.querySelectorAll("[data-rng]").forEach(function(x){x.onclick=function(){S.range=+x.dataset.rng;buildStock(sym)}});\n  var af=$("#addhere");if(af)af.onsubmit=function(e){e.preventDefault();S.holdings.push({symbol:sym,qty:parseFloat($("#hq").value)||0,avg:parseFloat($("#ha").value)||b.price});saveP();buildStock(sym)};\n  var rm=$("#rmhere");if(rm)rm.onclick=function(){S.holdings=S.holdings.filter(function(x){return x.symbol!==sym});saveP();buildStock(sym)};\n  if(S.tab==="overview"||S.tab==="tech")wireChart(b,t);\n}\nfunction tabBody(b,h,t,f){\n  if(S.tab==="fund")return fundTab(b,f);\n  if(S.tab==="tech")return techTab(b,t);\n  if(S.tab==="earn")return earnTab(b);\n  if(S.tab==="news")return newsTab(b);\n  return overviewTab(b,h,t,f);\n}\nfunction overviewTab(b,h,t,f){\n  var d=b.fund||{},o="",p=b.profile||{};\n  if(h&&h.qty>0){var pl=h.qty*(b.price-h.avg);o+=\'<div class="tiles"><div class="tile"><div class="l">Your position</div><div class="v">\'+nf(h.qty,0)+\' @ \'+money(h.avg,b.currency,2)+\'</div></div><div class="tile"><div class="l">Value</div><div class="v">\'+money(h.qty*b.price,b.currency,0)+\'</div></div><div class="tile"><div class="l">P&amp;L</div><div class="v \'+cls(pl)+\'">\'+sgn(pl)+\' (\'+pct(pl/(h.qty*h.avg)*100,1,true)+\')</div></div><div class="tile"><div class="l"></div><div class="v"><button id="rmhere">Remove from portfolio</button></div></div></div>\'}\n  else if(h){o+=\'<div class="card sub">On your watchlist. <button id="rmhere" class="link">Remove</button></div>\'}\n  else o+=\'<form class="card addbar" id="addhere"><b style="align-self:center">Add to portfolio</b><label>Quantity<input class="s" id="hq" type="number" min="0" step="any" placeholder="0"></label><label>Avg buy price<input class="s" id="ha" type="number" min="0" step="any" placeholder="\'+b.price.toFixed(2)+\'"></label><button class="primary" type="submit">Add</button></form>\';\n  o+=\'<section class="card"><div class="card-h"><h2>Price chart</h2><div class="chips">\'+[[63,"3M"],[126,"6M"],[252,"1Y"],[504,"2Y"]].map(function(r){return\'<button data-rng="\'+r[0]+\'" class="\'+(S.range===r[0]?"on":"")+\'">\'+r[1]+\'</button>\'}).join("")+\'</div></div>\'+chartSvg(b,t)+\'</section>\';\n  var pos=f.rows.filter(function(x){return x.k==="pos"}).slice(0,5),neg=f.rows.filter(function(x){return x.k==="neg"}).slice(0,5);\n  o+=\'<div class="cols"><section class="card"><div class="card-h"><h2>Fundamental summary</h2>\'+fundPill(b)+\'</div>\'+(f.all?\'<p style="margin:0 0 8px">\'+f.all.p+\' of \'+f.all.n+\' checks are good and \'+f.all.g+\' are weak.</p>\':\'<p class="sub">Fundamental data is not available for this stock.</p>\')+\n   (pos.length?\'<h3>Strengths</h3><ul class="pts">\'+pos.map(function(x){return\'<li><b>\'+esc(x.label)+\'</b>: \'+esc(x.val)+\'</li>\'}).join("")+\'</ul>\':"")+\n   (neg.length?\'<h3 style="margin-top:10px">Concerns</h3><ul class="pts">\'+neg.map(function(x){return\'<li><b>\'+esc(x.label)+\'</b>: \'+esc(x.val)+\'</li>\'}).join("")+\'</ul>\':"")+\'<p class="note" style="margin-bottom:0">Open the Fundamentals tab for every metric and what it means.</p></section>\';\n  o+=\'<section class="card"><div class="card-h"><h2>Technical summary</h2>\'+techPill(b)+\'</div>\'+(t?\'<p style="margin:0 0 8px">\'+t.pos+\' indicators bullish, \'+t.neg+\' bearish.</p><ul class="pts">\'+t.rows.slice(0,6).map(function(x){return\'<li>\'+esc(x.label)+\': <b>\'+esc(x.txt)+\'</b></li>\'}).join("")+\'</ul><p class="note" style="margin-bottom:0">Support \'+money(t.levels.S1,b.currency,0)+\' · Resistance \'+money(t.levels.R1,b.currency,0)+\'</p>\':\'<p class="sub">Not enough price history.</p>\')+\'</section></div>\';\n  var ns=b.newsSummary;\n  o+=\'<div class="cols"><section class="card"><div class="card-h"><h2>News mood</h2>\'+pill(ns.label)+\'</div><div class="bar" aria-hidden="true" style="height:12px">\'+(b.news.length?\'<i class="p" style="width:\'+ns.pos/b.news.length*100+\'%"></i><i class="u" style="width:\'+ns.neu/b.news.length*100+\'%"></i><i class="g" style="width:\'+ns.neg/b.news.length*100+\'%"></i>\':\'\')+\'</div><p class="sub">\'+ns.pos+\' positive · \'+ns.neu+\' neutral · \'+ns.neg+\' negative in the last 14 days</p>\'+b.news.slice(0,3).map(function(n){return newsRow(n,b.symbol,false)}).join("")+\'<button data-tab="news" id="tonews">All news →</button></section>\';\n  var lo=b.w52Low,hi=b.w52High,pp=hi>lo?(b.price-lo)/(hi-lo)*100:50;\n  o+=\'<section class="card"><div class="card-h"><h2>Key facts</h2></div><div class="sub">52-week range</div><div class="range"><b style="left:calc(\'+Math.max(0,Math.min(100,pp))+\'% - 2px)"></b></div><div class="meta" style="justify-content:space-between"><span class="mono">\'+money(lo,b.currency,0)+\'</span><span class="mono">\'+money(hi,b.currency,0)+\'</span></div>\'+\n   [["Market cap",big(d.marketCap,b.currency)],["Day range",money(b.dayLow,b.currency,2)+" – "+money(b.dayHigh,b.currency,2)],["Volume",b.volume?nf(b.volume):"–"],["Employees",p.fullTimeEmployees?nf(p.fullTimeEmployees):"–"],["Next results",b.earnings.nextDate?dday(b.earnings.nextDate):"Not announced"]].map(function(r){return\'<div class="metric"><span class="nm">\'+r[0]+\'</span><span class="val">\'+r[1]+\'</span></div>\'}).join("")+\n   (p.longBusinessSummary?\'<p class="sub" style="margin-bottom:0">\'+esc(p.longBusinessSummary.length>420?p.longBusinessSummary.slice(0,420)+"…":p.longBusinessSummary)+\'</p>\':"")+\'</section></div>\';\n  return o;\n}\nfunction fundTab(b,f){\n  var o=\'<div class="verdict \'+(f.all?f.all.k:"neu")+\'"><b>\'+(f.all?f.all.txt+" fundamentals":"No fundamental data")+\'</b>\'+(f.all?pill(f.all.k)+\'<span>\'+f.all.p+\' of \'+f.all.n+\' metrics good · \'+f.all.g+\' weak</span>\':"")+\'</div>\';\n  if(f.bank)o+=\'<p class="note">This is a bank or lender, so debt, cash-flow and margin tests do not apply and are skipped. Focus on P/B, ROE, ROA and growth.</p>\';\n  o+=\'<div class="cols">\';\n  f.groups.forEach(function(g){\n    o+=\'<section class="card"><div class="card-h"><h2>\'+g.g+\'</h2>\'+(g.sc?pill(g.sc.k,(g.sc.k==="pos"?"▲ ":g.sc.k==="neg"?"▼ ":"● ")+g.sc.txt):pill("na","n/a"))+\'</div>\'+\n     (g.sc?\'<div class="bar" style="margin-bottom:6px" aria-hidden="true"><i class="p" style="width:\'+g.sc.p/g.sc.n*100+\'%"></i><i class="u" style="width:\'+(g.sc.n-g.sc.p-g.sc.g)/g.sc.n*100+\'%"></i><i class="g" style="width:\'+g.sc.g/g.sc.n*100+\'%"></i></div>\':"");\n    g.rows.forEach(function(r){o+=\'<div class="metric"><span class="nm">\'+esc(r.label)+\'</span><span class="val">\'+esc(r.val)+\' \'+(r.k==="na"?pill("na","n/a"):pill(r.k,r.k==="pos"?"▲ Good":r.k==="neg"?"▼ Weak":"● Fair"))+\'</span><span class="ex">\'+esc(r.why)+\'<br><i>\'+esc(r.th)+\'</i></span></div>\'});\n    o+=\'</section>\'});\n  var rc=b.earnings.recs||{},tot=(rc.strongBuy||0)+(rc.buy||0)+(rc.hold||0)+(rc.sell||0)+(rc.strongSell||0);\n  if(tot){o+=\'<section class="card"><div class="card-h"><h2>Analyst recommendations</h2></div><div class="bar" style="height:14px" aria-hidden="true"><i class="p" style="width:\'+((rc.strongBuy+rc.buy)/tot*100)+\'%"></i><i class="u" style="width:\'+rc.hold/tot*100+\'%"></i><i class="g" style="width:\'+((rc.sell+rc.strongSell)/tot*100)+\'%"></i></div><p class="sub">\'+(rc.strongBuy+rc.buy)+\' buy · \'+rc.hold+\' hold · \'+(rc.sell+rc.strongSell)+\' sell. Target range \'+money(b.fund.targetLowPrice,b.currency,0)+\' to \'+money(b.fund.targetHighPrice,b.currency,0)+\'.</p></section>\'}\n  return o+\'</div>\';\n}\nfunction techTab(b,t){\n  if(!t)return \'<p class="sub">Not enough price history for technical analysis.</p>\';\n  var o=\'<div class="verdict \'+t.k+\'"><b>\'+t.txt+\' technicals</b>\'+pill(t.k)+\'<span>\'+t.pos+\' bullish · \'+t.neg+\' bearish signals out of \'+t.rows.length+\'</span></div>\';\n  o+=\'<section class="card"><div class="card-h"><h2>Price, averages, volume and RSI</h2><div class="chips">\'+[[63,"3M"],[126,"6M"],[252,"1Y"],[504,"2Y"]].map(function(r){return\'<button data-rng="\'+r[0]+\'" class="\'+(S.range===r[0]?"on":"")+\'">\'+r[1]+\'</button>\'}).join("")+\'</div></div>\'+chartSvg(b,t)+\'</section>\';\n  o+=\'<div class="cols"><section class="card"><div class="card-h"><h2>Indicators</h2></div>\'+t.rows.map(function(r){return\'<div class="metric"><span class="nm">\'+esc(r.label)+\'</span><span class="val">\'+esc(r.val)+\' \'+pill(r.k,(r.k==="pos"?"▲ ":r.k==="neg"?"▼ ":"● ")+r.txt)+\'</span><span class="ex">\'+esc(r.why)+\'</span></div>\'}).join("")+\'</section>\';\n  var L=t.levels,c=b.currency;\n  o+=\'<div style="display:flex;flex-direction:column;gap:18px"><section class="card"><div class="card-h"><h2>Support and resistance</h2></div>\'+[["Resistance (nearest swing high)",L.R1,"neg"],["Pivot resistance R1",L.R1p,"neg"],["Current price",b.price,"neu"],["Pivot point",L.P,"neu"],["Pivot support S1",L.S1p,"pos"],["Support (nearest swing low)",L.S1,"pos"]].map(function(r){return\'<div class="metric"><span class="nm">\'+r[0]+\'</span><span class="val">\'+money(r[1],c,2)+\'</span></div>\'}).join("")+\'<p class="note" style="margin-bottom:0">Support is where falls have recently stopped, resistance is where rises have stalled. A close beyond either often starts a bigger move.</p></section>\';\n  o+=\'<section class="card"><div class="card-h"><h2>Returns</h2></div>\'+t.ret.map(function(r){return\'<div class="metric"><span class="nm">\'+r[0]+\'</span><span class="val \'+(r[1]==null?"":cls(r[1]))+\'">\'+pct(r[1],1,true)+\'</span></div>\'}).join("")+\'</section></div></div>\';\n  return o;\n}\nfunction earnTab(b){\n  var e=b.earnings,o="";\n  o+=\'<div class="tiles"><div class="tile"><div class="l">Next results date</div><div class="v">\'+(e.nextDate?dday(e.nextDate):"Not announced")+\'</div></div>\'+(lastEarn(b)?\'<div class="tile"><div class="l">Last quarter result</div><div class="v">\'+earnPill(lastEarn(b))+\'</div></div>\':"")+\'</div>\';\n  o+=\'<div class="cols"><section class="card"><div class="card-h"><h2>EPS: estimate vs actual</h2></div>\'+(e.history.length?\'<div class="scroll"><table><thead><tr><th>Quarter</th><th class="n">Estimate</th><th class="n">Actual</th><th class="n">Surprise</th><th>Result</th></tr></thead><tbody>\'+e.history.slice().reverse().map(function(x){return\'<tr><td>\'+qlabel(x.quarter)+\'</td><td class="n">\'+(x.epsEstimate!=null?x.epsEstimate.toFixed(2):"–")+\'</td><td class="n">\'+x.epsActual.toFixed(2)+\'</td><td class="n">\'+pct(x.surprisePct,1,true)+\'</td><td>\'+earnPill(x)+\'</td></tr>\'}).join("")+\'</tbody></table></div>\':\'<p class="sub">EPS history is not available for this stock.</p>\')+\'</section>\';\n  var q=e.quarterly||[];\n  o+=\'<section class="card"><div class="card-h"><h2>Revenue and profit by quarter</h2></div>\'+(q.length?\'<div class="scroll"><table><thead><tr><th>Quarter</th><th class="n">Revenue</th><th class="n">vs prev</th><th class="n">Net profit</th><th class="n">vs prev</th></tr></thead><tbody>\'+q.map(function(x,i){var pv=q[i-1];function ch(a,b2){return pv&&b2?pct((a/b2-1)*100,1,true):"–"}\n    return\'<tr><td>\'+esc(x.date)+\'</td><td class="n">\'+big(x.revenue,b.currency)+\'</td><td class="n">\'+(pv?ch(x.revenue,pv.revenue):"–")+\'</td><td class="n">\'+big(x.earnings,b.currency)+\'</td><td class="n">\'+(pv?ch(x.earnings,pv.earnings):"–")+\'</td></tr>\'}).join("")+\'</tbody></table></div>\':\'<p class="sub">Quarterly financials are not available for this stock.</p>\')+\'</section></div>\';\n  return o;\n}\nfunction newsTab(b){\n  var ns=b.newsSummary,items=b.news.filter(function(n){return S.newsFilter==="all"||n.sentiment===S.newsFilter});\n  var o=\'<section class="card"><div class="card-h"><h2>\'+esc(short(b.symbol))+\' news mood</h2>\'+pill(ns.label,(ns.label==="pos"?"▲ Positive overall":ns.label==="neg"?"▼ Negative overall":"● Neutral overall"))+\'</div><div class="bar" style="height:12px" aria-hidden="true">\'+(b.news.length?\'<i class="p" style="width:\'+ns.pos/b.news.length*100+\'%"></i><i class="u" style="width:\'+ns.neu/b.news.length*100+\'%"></i><i class="g" style="width:\'+ns.neg/b.news.length*100+\'%"></i>\':\'\')+\'</div><p class="sub" style="margin-bottom:0">\'+ns.pos+\' positive · \'+ns.neu+\' neutral · \'+ns.neg+\' negative from the last 14 days, newest first. Tags come from the wording of each headline and summary.</p></section>\';\n  o+=\'<section class="card"><div class="card-h"><h2>Headlines</h2><div class="chips">\'+[["all","All"],["pos","Positive"],["neg","Negative"],["neu","Neutral"]].map(function(f){return\'<button data-sf="\'+f[0]+\'" class="\'+(S.newsFilter===f[0]?"on":"")+\'">\'+f[1]+\'</button>\'}).join("")+\'</div></div><div class="news">\'+(items.length?items.map(function(n){return newsRow(n,b.symbol,false)}).join(""):\'<p class="loading">No news found for this filter.</p>\')+\'</div></section>\';\n  return o;\n}\n\n/* ---------- chart ---------- */\nfunction chartGeom(b,t){var H=b.history,n=H.c.length,k=Math.min(S.range,n),s=n-k;return{H:H,n:n,k:k,s:s}}\nfunction chartSvg(b,t){\n  var g=chartGeom(b,t),H=g.H,s=g.s,k=g.k,W=900,L=56,R=10,pT=8,pH=250,vT=pT+pH+6,vH=48,rT=vT+vH+12,rH=64,Ht=rT+rH+18;\n  var cs=H.c.slice(s),mn=Math.min.apply(null,cs),mx=Math.max.apply(null,cs);\n  [t&&t.s50,t&&t.s200].forEach(function(a){if(a)a.slice(s).forEach(function(v){if(v!=null){if(v<mn)mn=v;if(v>mx)mx=v}})});\n  var pd=(mx-mn)*.06;mn-=pd;mx+=pd;\n  function X(i){return L+i*(W-L-R)/(k-1)}function Y(v){return pT+(mx-v)*pH/(mx-mn)}\n  var o=\'<svg class="chart" id="chart" viewBox="0 0 \'+W+\' \'+Ht+\'" role="img" aria-label="Price chart for \'+esc(b.symbol)+\'">\';\n  for(var i=0;i<=4;i++){var v=mn+(mx-mn)*i/4,y=Y(v);o+=\'<line x1="\'+L+\'" x2="\'+(W-R)+\'" y1="\'+y+\'" y2="\'+y+\'" stroke="var(--line)"/><text x="\'+(L-6)+\'" y="\'+(y+3)+\'" text-anchor="end">\'+nf(v,v>1000?0:1)+\'</text>\'}\n  var lastM=-1;for(i=0;i<k;i++){var d=new Date(H.t[s+i]*1000),m=d.getMonth();if(m!==lastM&&i>0&&(k<=130||m%3===0)){o+=\'<text x="\'+X(i)+\'" y="\'+(Ht-4)+\'" text-anchor="middle">\'+d.toLocaleDateString("en-GB",{month:"short",year:"2-digit"})+\'</text>\'}lastM=m}\n  function path(a,col,w){var p="",on=false;a.slice(s).forEach(function(v,i){if(v==null)return;p+=(on?"L":"M")+X(i).toFixed(1)+" "+Y(v).toFixed(1);on=true});return \'<path d="\'+p+\'" fill="none" stroke="\'+col+\'" stroke-width="\'+w+\'" stroke-linejoin="round"/>\'}\n  if(t){o+=path(t.s200,"var(--neg)",1.3)+path(t.s50,"var(--neu)",1.3)}\n  o+=path(H.c,"var(--fg)",1.6);\n  o+=\'<circle cx="\'+X(k-1)+\'" cy="\'+Y(last(H.c))+\'" r="3.5" fill="var(--fg)"/>\';\n  var vm=Math.max.apply(null,H.v.slice(s))||1;\n  for(i=0;i<k;i++){var h2=H.v[s+i]/vm*vH,up=H.c[s+i]>=(H.c[s+i-1]||H.c[s+i]);o+=\'<rect x="\'+(X(i)-Math.max(.4,(W-L-R)/k*.35))+\'" y="\'+(vT+vH-h2)+\'" width="\'+Math.max(.8,(W-L-R)/k*.7)+\'" height="\'+h2+\'" fill="\'+(up?"var(--pos)":"var(--neg)")+\'" opacity=".55"/>\'}\n  o+=\'<text x="\'+(L-6)+\'" y="\'+(vT+10)+\'" text-anchor="end">Vol</text>\';\n  if(t){var r=t.rsi.slice(s);function RY(v){return rT+(100-v)*rH/100}\n    [30,70].forEach(function(v){o+=\'<line x1="\'+L+\'" x2="\'+(W-R)+\'" y1="\'+RY(v)+\'" y2="\'+RY(v)+\'" stroke="var(--line)" stroke-dasharray="3 3"/><text x="\'+(L-6)+\'" y="\'+(RY(v)+3)+\'" text-anchor="end">\'+v+\'</text>\'});\n    var p="",on=false;r.forEach(function(v,i){if(v==null)return;p+=(on?"L":"M")+X(i).toFixed(1)+" "+RY(v).toFixed(1);on=true});\n    o+=\'<path d="\'+p+\'" fill="none" stroke="var(--accent)" stroke-width="1.4"/><text x="\'+(L-6)+\'" y="\'+(rT+10)+\'" text-anchor="end">RSI</text>\'}\n  o+=\'<line id="xh" x1="0" x2="0" y1="\'+pT+\'" y2="\'+(rT+rH)+\'" stroke="var(--muted)" stroke-dasharray="2 3" visibility="hidden"/><text id="xt" x="\'+(L+4)+\'" y="\'+(pT+11)+\'" style="fill:var(--fg);font-size:11px"></text>\';\n  o+=\'<g transform="translate(\'+(W-R-250)+\' \'+(pT+12)+\')"><text x="0" y="0" style="fill:var(--fg)">— Price</text><text x="64" y="0" style="fill:var(--neu)">— 50-day</text><text x="132" y="0" style="fill:var(--neg)">— 200-day</text></g></svg>\';\n  return o;\n}\nfunction wireChart(b,t){\n  var svg=$("#chart");if(!svg)return;var g=chartGeom(b,t),W=900,L=56,R=10,xh=$("#xh"),xt=$("#xt");\n  svg.addEventListener("mousemove",function(e){var r=svg.getBoundingClientRect(),x=(e.clientX-r.left)/r.width*W,i=Math.round((x-L)/(W-L-R)*(g.k-1));if(i<0||i>=g.k)return;\n    var px=L+i*(W-L-R)/(g.k-1);xh.setAttribute("x1",px);xh.setAttribute("x2",px);xh.setAttribute("visibility","visible");\n    xt.textContent=new Date(g.H.t[g.s+i]*1000).toLocaleDateString("en-GB",{day:"numeric",month:"short",year:"numeric"})+"  "+nf(g.H.c[g.s+i],2)+"  vol "+nf(g.H.v[g.s+i])});\n  svg.addEventListener("mouseleave",function(){xh.setAttribute("visibility","hidden");xt.textContent=""});\n}\ndocument.addEventListener("click",function(e){var b=e.target.closest("#tonews");if(b){S.tab="news";refresh()}});\n\n/* ---------- start ---------- */\nbuildHome();\n(HOSTED?new Promise(function(res){var p=null;try{p=JSON.parse(localStorage.getItem("sd_portfolio")||"null")}catch(e){}res(p||{holdings:[],orders:[]})}):api("/api/portfolio")).then(function(p){S.holdings=p.holdings||[];S.orders=p.orders||[];S.ready=true;refresh();\n  S.holdings.forEach(function(h){load(h.symbol)})}).catch(function(e){app.insertAdjacentHTML("beforeend",\'<p class="err">Could not load portfolio: \'+esc(e.message)+\'</p>\')});\nif(route().name==="stock")refresh();\nsetInterval(function(){S.holdings.forEach(function(h){load(h.symbol,true)})},300000);\n</script>\n</body>\n</html>\n'
+CACHE = {}
+CACHE_TTL = 300
+LOCK = threading.Lock()
+
+# ----------------------------------------------------------------------------
+# Sentiment: weighted word lists. Each entry is (regex, weight, label).
+# ----------------------------------------------------------------------------
+POS = [
+    (r"beats? (?:street |market )?(?:estimates|expectations|forecasts)", 3, "beats estimates"),
+    (r"(?:profit|earnings|net profit|pat) (?:rises?|jumps?|surges?|climbs?|up|grows?|soars?|doubles?)", 3, "profit up"),
+    (r"record (?:profit|revenue|sales|high|order|quarter|earnings)", 3, "record result"),
+    (r"strong (?:results?|earnings|quarter|demand|growth|performance|order)", 3, "strong results"),
+    (r"(?:raises?|hikes?|lifts?) (?:guidance|outlook|forecast|target)", 3, "raises outlook"),
+    (r"(?:order|contract|deal|mandate)s? win|(?:wins?|bags?|secures?|lands?|clinch(?:es)?) (?:an? )?(?:\S+ ){0,3}(?:order|contract|deal|mandate)", 3, "order win"),
+    (r"upgrad(?:es?|ed)", 2, "upgrade"),
+    (r"target (?:price )?(?:raised|hiked|upped)", 2, "target raised"),
+    (r"outperform|overweight|top pick|accumulate", 2, "analyst positive"),
+    (r"\bbuy (?:rating|call|recommendation)|\bbuy\b", 1, "buy view"),
+    (r"buy-?back|special dividend|bonus (?:issue|shares)|stock split", 2, "shareholder return"),
+    (r"dividend", 1, "dividend"),
+    (r"(?:surges?|soars?|jumps?|rall(?:y|ies)|spikes?|skyrockets?)", 2, "price surge"),
+    (r"(?:gains?|rises?|climbs?|advances?|rebounds?|recovers?)", 1, "price gain"),
+    (r"(?:approval|approved|nod|clearance|go-ahead)", 2, "approval"),
+    (r"margin expansion|margins? (?:improve|widen)", 2, "margin up"),
+    (r"debt[- ]free|reduces? debt|deleverag", 2, "debt down"),
+    (r"expansion|expands?|launch(?:es|ed)?|new plant|capacity addition|acquir(?:es?|ed)", 1, "expansion"),
+    (r"robust|upbeat|bullish|optimis|healthy|resilient|positive|outlook improves|turnaround|boost", 2, "positive tone"),
+    (r"growth|grows?|growing", 1, "growth"),
+    (r"all-time high|52-week high|fresh high|new high", 2, "new high"),
+]
+NEG = [
+    (r"miss(?:es|ed)? (?:street |market )?(?:estimates|expectations|forecasts)", -3, "misses estimates"),
+    (r"(?:net )?loss(?:es)?|turns? to (?:a )?loss|swings? to (?:a )?loss", -3, "loss"),
+    (r"(?:profit|earnings|net profit|pat) (?:falls?|drops?|declines?|slips?|slumps?|dips?|down|plunges?|tumbles?|shrinks?)", -3, "profit down"),
+    (r"(?:cuts?|slashes?|lowers?|trims?|reduces?) (?:guidance|outlook|forecast|target)", -3, "cuts outlook"),
+    (r"target (?:price )?(?:cut|lowered|slashed|reduced)", -2, "target cut"),
+    (r"downgrad(?:es?|ed)", -2, "downgrade"),
+    (r"underperform|underweight|\bsell (?:rating|call|recommendation)|\bsell\b", -2, "analyst negative"),
+    (r"fraud|scam|scandal|embezzl|money laundering|insider trading|accounting irregular", -3, "fraud allegation"),
+    (r"probe|raid|investigation|enquiry|inquiry|sebi (?:notice|order|action)|show[- ]cause|penalt(?:y|ies)|fined?\b|lawsuit|sued|court|tax demand|summons", -2, "legal/regulatory"),
+    (r"default|insolven|bankrupt|nclt|debt (?:crisis|trouble)|rating (?:cut|downgrade)", -3, "credit stress"),
+    (r"plunges?|tumbles?|crash(?:es|ed)?|sinks?|slumps?|nosedives?|selloff|sell-off|rout", -3, "sharp fall"),
+    (r"falls?|drops?|declines?|slides?|slips?|dips?|weakens?|lower|down\b", -1, "price down"),
+    (r"weak(?:ness|er)?|slowdown|slows?|sluggish|soft(?:ness)?|muted|subdued|pressure|headwinds?|disruption", -2, "weakness"),
+    (r"warns?|warning|concerns?|worries|worry|risks?|uncertain|cautious|bearish|pessimis", -1, "caution"),
+    (r"delay(?:s|ed)?|halts?|suspend(?:s|ed)?|suspension|ban(?:s|ned)?|recall|shutdown|strike|cancel(?:s|led)?", -2, "disruption"),
+    (r"layoffs?|job cuts|resigns?|steps? down|exit(?:s)?\b|attrition", -1, "management/people"),
+    (r"stake sale|promoter (?:sells|pledge)|pledg(?:e|ed|es)|block deal sell|insider selling", -1, "holder selling"),
+    (r"52-week low|fresh low|new low|lowest in", -2, "new low"),
+]
+POS_C = [(re.compile(p, re.I), w, l) for p, w, l in POS]
+NEG_C = [(re.compile(p, re.I), w, l) for p, w, l in NEG]
+CATS = [
+    ("Results", r"result|earnings|q[1-4]\b|quarter|profit|revenue|net income|ebitda|eps|margin"),
+    ("Orders & deals", r"order|contract|deal|mandate|acqui|merger|stake|partnership|tie-?up"),
+    ("Analyst view", r"upgrade|downgrade|target|rating|analyst|brokerage|recommend|buy|sell|overweight|underweight"),
+    ("Legal & regulatory", r"sebi|probe|raid|court|penalt|fine|tax|regulator|rbi|fda|approval|notice|nclt"),
+    ("Dividend & buyback", r"dividend|buy-?back|bonus|split"),
+    ("Management", r"ceo|cfo|md\b|chairman|resign|appoint|board|promoter"),
+    ("Product & expansion", r"launch|plant|capacity|expansion|new product|rollout"),
+]
+CATS = [(n, re.compile(p, re.I)) for n, p in CATS]
+
+
+def analyse(title, summary=""):
+    text = (title + " " + (summary or "")).strip()
+    score, reasons = 0, []
+    used = set()
+    for pat, w, label in POS_C + NEG_C:
+        m = pat.search(text)
+        if m and label not in used:
+            used.add(label)
+            score += w
+            reasons.append({"word": m.group(0).strip()[:40], "label": label, "weight": w})
+    score = max(-8, min(8, score))
+    sent = "pos" if score >= 1 else "neg" if score <= -1 else "neu"
+    cat = "General"
+    for name, pat in CATS:
+        if pat.search(text):
+            cat = name
+            break
+    return sent, score, reasons, cat
+
+
+# ----------------------------------------------------------------------------
+# HTTP helpers
+# ----------------------------------------------------------------------------
+_jar = http.cookiejar.CookieJar()
+_opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(_jar))
+_crumb = {"v": None, "t": 0}
+
+
+def http_get(url, timeout=12, headers=None):
+    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "*/*",
+                                               "Accept-Language": "en-US,en;q=0.9", **(headers or {})})
+    with _opener.open(req, timeout=timeout) as r:
+        return r.read()
+
+
+def get_crumb(force=False):
+    with LOCK:
+        if _crumb["v"] and not force and time.time() - _crumb["t"] < 3600:
+            return _crumb["v"]
+        try:
+            http_get("https://fc.yahoo.com", timeout=8)
+        except Exception:
+            pass  # this endpoint returns 404 but still sets the cookie
+        for host in ("query1", "query2"):
+            try:
+                c = http_get(f"https://{host}.finance.yahoo.com/v1/test/getcrumb", timeout=8).decode().strip()
+                if c and "<" not in c:
+                    _crumb.update(v=c, t=time.time())
+                    return c
+            except Exception:
+                continue
+    return None
+
+
+def yahoo_json(path, params, retry=True):
+    last = None
+    for host in ("query1", "query2"):
+        url = f"https://{host}.finance.yahoo.com{path}?" + urllib.parse.urlencode(params)
+        try:
+            return json.loads(http_get(url))
+        except urllib.error.HTTPError as e:
+            last = e
+            if e.code in (401, 403, 429) and retry:
+                break
+        except Exception as e:
+            last = e
+    raise last or RuntimeError("Yahoo request failed")
+
+
+def raw(v):
+    if isinstance(v, dict):
+        return v.get("raw")
+    return v
+
+
+# ----------------------------------------------------------------------------
+# Data fetchers
+# ----------------------------------------------------------------------------
+def fetch_chart(symbol):
+    d = yahoo_json(f"/v8/finance/chart/{urllib.parse.quote(symbol)}",
+                   {"range": "2y", "interval": "1d", "includePrePost": "false"})
+    res = d["chart"]["result"][0]
+    meta = res["meta"]
+    q = res["indicators"]["quote"][0]
+    ts = res.get("timestamp") or []
+    rows = [(t, q["open"][i], q["high"][i], q["low"][i], q["close"][i], q["volume"][i])
+            for i, t in enumerate(ts) if q["close"][i] is not None]
+    hist = {k: [r[j] for r in rows] for j, k in enumerate(["t", "o", "h", "l", "c", "v"])}
+    hist["v"] = [x or 0 for x in hist["v"]]
+    return meta, hist
+
+
+QS_MODULES = ("summaryDetail,defaultKeyStatistics,financialData,majorHoldersBreakdown,price,"
+              "earnings,earningsHistory,calendarEvents,recommendationTrend,assetProfile")
+
+
+def fetch_summary(symbol):
+    for attempt in range(2):
+        crumb = get_crumb(force=attempt == 1)
+        params = {"modules": QS_MODULES}
+        if crumb:
+            params["crumb"] = crumb
+        try:
+            d = yahoo_json(f"/v10/finance/quoteSummary/{urllib.parse.quote(symbol)}", params, retry=False)
+            return d["quoteSummary"]["result"][0]
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403) and attempt == 0:
+                continue
+            raise
+    return {}
+
+
+def flatten_fund(qs):
+    out = {}
+    for mod in ("summaryDetail", "defaultKeyStatistics", "financialData", "majorHoldersBreakdown", "price"):
+        for k, v in (qs.get(mod) or {}).items():
+            val = raw(v) if isinstance(v, dict) else v
+            if isinstance(val, (int, float, str)) and k not in out:
+                out[k] = val
+    return out
+
+
+def parse_earnings(qs):
+    hist = []
+    for h in (qs.get("earningsHistory") or {}).get("history", []):
+        act, est = raw(h.get("epsActual")), raw(h.get("epsEstimate"))
+        if act is None:
+            continue
+        sp = None
+        if est not in (None, 0):
+            sp = (act - est) / abs(est) * 100
+        hist.append({"quarter": raw(h.get("quarter")), "epsActual": act, "epsEstimate": est, "surprisePct": sp})
+    hist.sort(key=lambda x: x["quarter"] or 0)
+    fc = (qs.get("earnings") or {}).get("financialsChart") or {}
+
+    def fin(rows):
+        return [{"date": r.get("date"), "revenue": raw(r.get("revenue")), "earnings": raw(r.get("earnings"))}
+                for r in rows or []]
+    nxt = None
+    ed = ((qs.get("calendarEvents") or {}).get("earnings") or {}).get("earningsDate") or []
+    if ed:
+        nxt = raw(ed[0])
+    trend = {}
+    for t in (qs.get("recommendationTrend") or {}).get("trend", []):
+        if t.get("period") == "0m":
+            trend = {k: t.get(k, 0) for k in ("strongBuy", "buy", "hold", "sell", "strongSell")}
+    return {"history": hist, "quarterly": fin(fc.get("quarterly")), "yearly": fin(fc.get("yearly")),
+            "nextDate": nxt, "recs": trend}
+
+
+def parse_profile(qs):
+    p = qs.get("assetProfile") or {}
+    return {k: p.get(k) for k in ("sector", "industry", "longBusinessSummary", "website",
+                                  "fullTimeEmployees", "city", "country")}
+
+
+def clean_html(s):
+    s = re.sub(r"<[^>]+>", " ", s or "")
+    return re.sub(r"\s+", " ", html.unescape(s)).strip()
+
+
+def fetch_google_news(query):
+    q = urllib.parse.quote(query + " when:14d")
+    url = f"https://news.google.com/rss/search?q={q}&hl=en-IN&gl=IN&ceid=IN:en"
+    root = ET.fromstring(http_get(url, timeout=10))
+    items = []
+    for it in root.iter("item"):
+        title = (it.findtext("title") or "").strip()
+        src = (it.findtext("source") or "").strip()
+        if src and title.endswith(" - " + src):
+            title = title[: -len(src) - 3].strip()
+        try:
+            ts = int(parsedate_to_datetime(it.findtext("pubDate")).timestamp())
+        except Exception:
+            ts = 0
+        desc = clean_html(it.findtext("description"))
+        if desc.startswith(title):
+            desc = desc[len(title):].strip(" - ")
+        if src and desc.endswith(src):
+            desc = desc[: -len(src)].strip()
+        items.append({"title": title, "source": src or "Google News", "link": it.findtext("link") or "",
+                      "ts": ts, "summary": desc if len(desc) > 25 else ""})
+    return items
+
+
+def fetch_yahoo_news(symbol):
+    d = yahoo_json("/v1/finance/search", {"q": symbol, "quotesCount": 0, "newsCount": 12})
+    out = []
+    for n in d.get("news", []):
+        out.append({"title": n.get("title", ""), "source": n.get("publisher", "Yahoo Finance"),
+                    "link": n.get("link", ""), "ts": n.get("providerPublishTime", 0), "summary": ""})
+    return out
+
+
+def meta_description(url):
+    try:
+        page = http_get(url, timeout=5).decode("utf-8", "ignore")[:200000]
+    except Exception:
+        return ""
+    for pat in (r'<meta[^>]+property=["\']og:description["\'][^>]+content=["\']([^"\']+)',
+                r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']+)'):
+        m = re.search(pat, page, re.I)
+        if m:
+            return html.unescape(m.group(1)).strip()
+    return ""
+
+
+def build_news(symbol, name):
+    items = []
+    base = re.sub(r"\.(NS|BO)$", "", symbol)
+    short = re.sub(r"\b(limited|ltd\.?|inc\.?|corporation|corp\.?|company|co\.?)\b", "", name or base, flags=re.I).strip(" ,.")
+    queries = [f'"{short}" share' if short else base, f"{base} stock results"]
+    jobs = []
+    with cf.ThreadPoolExecutor(max_workers=4) as ex:
+        for q in queries:
+            jobs.append(ex.submit(fetch_google_news, q))
+        jobs.append(ex.submit(fetch_yahoo_news, symbol))
+        for j in jobs:
+            try:
+                items += j.result(timeout=20)
+            except Exception:
+                pass
+    seen, uniq = set(), []
+    for it in sorted(items, key=lambda x: -x["ts"]):
+        key = re.sub(r"\W+", "", it["title"].lower())[:60]
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        uniq.append(it)
+    uniq = uniq[:20]
+    # try to fetch a real description for direct (Yahoo) links
+    direct = [it for it in uniq[:10] if "news.google.com" not in it["link"] and not it["summary"]]
+    if direct:
+        with cf.ThreadPoolExecutor(max_workers=5) as ex:
+            for it, desc in zip(direct, ex.map(lambda i: meta_description(i["link"]), direct)):
+                it["summary"] = desc
+    for it in uniq:
+        it["sentiment"], it["score"], it["reasons"], it["category"] = analyse(it["title"], it["summary"])
+    return uniq
+
+
+def news_summary(news):
+    pos = sum(1 for n in news if n["sentiment"] == "pos")
+    neg = sum(1 for n in news if n["sentiment"] == "neg")
+    neu = len(news) - pos - neg
+    score = sum(n["score"] for n in news[:12])
+    label = "pos" if score >= 3 else "neg" if score <= -3 else "neu"
+    return {"pos": pos, "neg": neg, "neu": neu, "score": score, "label": label}
+
+
+def get_bundle(symbol, force=False):
+    symbol = symbol.strip().upper()
+    key = ("b", symbol, DEMO)
+    with LOCK:
+        hit = CACHE.get(key)
+        if hit and not force and time.time() - hit[0] < CACHE_TTL:
+            return hit[1]
+    data = demo_bundle(symbol) if DEMO else live_bundle(symbol)
+    with LOCK:
+        CACHE[key] = (time.time(), data)
+    return data
+
+
+def live_bundle(symbol):
+    with cf.ThreadPoolExecutor(max_workers=2) as ex:
+        f_chart = ex.submit(fetch_chart, symbol)
+        f_sum = ex.submit(fetch_summary, symbol)
+        meta, hist = f_chart.result()
+        try:
+            qs = f_sum.result()
+            warn = None
+        except Exception as e:
+            qs, warn = {}, f"Fundamentals unavailable ({e})"
+    fund = flatten_fund(qs)
+    name = meta.get("longName") or meta.get("shortName") or fund.get("longName") or symbol
+    price = meta.get("regularMarketPrice")
+    prev = meta.get("chartPreviousClose") or (hist["c"][-2] if len(hist["c"]) > 1 else price)
+    prev = meta.get("previousClose") or prev
+    news = build_news(symbol, name)
+    return {
+        "symbol": symbol, "name": name, "exchange": meta.get("fullExchangeName") or meta.get("exchangeName"),
+        "currency": meta.get("currency", ""), "price": price, "prevClose": prev,
+        "change": (price - prev) if price and prev else 0,
+        "changePct": ((price / prev - 1) * 100) if price and prev else 0,
+        "dayHigh": meta.get("regularMarketDayHigh"), "dayLow": meta.get("regularMarketDayLow"),
+        "volume": meta.get("regularMarketVolume"),
+        "w52High": meta.get("fiftyTwoWeekHigh"), "w52Low": meta.get("fiftyTwoWeekLow"),
+        "history": hist, "fund": fund, "earnings": parse_earnings(qs), "profile": parse_profile(qs),
+        "news": news, "newsSummary": news_summary(news), "warning": warn,
+        "fetchedAt": int(time.time()), "demo": False,
+    }
+
+
+def search(q):
+    if DEMO:
+        pool = [("RELIANCE.NS", "Reliance Industries Limited", "NSE"), ("TCS.NS", "Tata Consultancy Services Limited", "NSE"),
+                ("HDFCBANK.NS", "HDFC Bank Limited", "NSE"), ("INFY.NS", "Infosys Limited", "NSE"),
+                ("TATAMOTORS.NS", "Tata Motors Limited", "NSE"), ("ITC.NS", "ITC Limited", "NSE"),
+                ("SBIN.NS", "State Bank of India", "NSE"), ("AAPL", "Apple Inc.", "NASDAQ")]
+        ql = q.lower()
+        return [{"symbol": s, "name": n, "exchange": e} for s, n, e in pool if ql in s.lower() or ql in n.lower()][:8]
+    d = yahoo_json("/v1/finance/search", {"q": q, "quotesCount": 10, "newsCount": 0})
+    out = []
+    for x in d.get("quotes", []):
+        if x.get("quoteType") in ("EQUITY", "ETF") and x.get("symbol"):
+            out.append({"symbol": x["symbol"], "name": x.get("longname") or x.get("shortname") or x["symbol"],
+                        "exchange": x.get("exchDisp") or x.get("exchange")})
+    # put Indian listings first
+    out.sort(key=lambda x: 0 if x["symbol"].endswith((".NS", ".BO")) else 1)
+    return out[:8]
+
+
+# ----------------------------------------------------------------------------
+# Demo data (only with --demo)
+# ----------------------------------------------------------------------------
+DEMO_NAMES = {
+    "RELIANCE.NS": ("Reliance Industries Limited", 1485, "Energy", "Oil & Gas Refining"),
+    "TCS.NS": ("Tata Consultancy Services Limited", 3188, "Technology", "IT Services"),
+    "HDFCBANK.NS": ("HDFC Bank Limited", 1002, "Financial Services", "Banks - Regional"),
+    "INFY.NS": ("Infosys Limited", 1544, "Technology", "IT Services"),
+    "TATAMOTORS.NS": ("Tata Motors Limited", 728, "Consumer Cyclical", "Auto Manufacturers"),
+    "ITC.NS": ("ITC Limited", 412, "Consumer Defensive", "Tobacco"),
+    "SBIN.NS": ("State Bank of India", 842, "Financial Services", "Banks - Regional"),
+    "AAPL": ("Apple Inc.", 232, "Technology", "Consumer Electronics"),
+}
+DEMO_HEADLINES = [
+    ("{n} Q2 profit rises 12%, beats estimates on strong demand", "Business Standard", 2),
+    ("Brokerages raise target price on {n} after strong results", "Moneycontrol", 5),
+    ("{n} wins large order worth Rs 1,800 crore", "Economic Times", 9),
+    ("{n} shares slip as margin pressure weighs on outlook", "Mint", 14),
+    ("SEBI issues show-cause notice to {n} over disclosure lapse", "Reuters", 22),
+    ("{n} announces final dividend and record date", "NDTV Profit", 30),
+    ("Analysts stay cautious on {n} amid slowdown concerns", "CNBC-TV18", 41),
+    ("{n} launches new product line, expands capacity", "The Hindu BusinessLine", 55),
+]
+
+
+def demo_bundle(symbol):
+    rnd = random.Random(int(hashlib.md5(symbol.encode()).hexdigest()[:8], 16))
+    name, price, sector, industry = DEMO_NAMES.get(symbol, (symbol, 500, "Industrials", "Conglomerates"))
+    n = 500
+    drift = rnd.uniform(-0.0004, 0.0009)
+    c = [0] * n
+    c[-1] = price
+    for i in range(n - 2, -1, -1):
+        c[i] = c[i + 1] / (1 + drift + rnd.gauss(0, 0.014))
+    now = int(time.time())
+    t = [now - (n - 1 - i) * 86400 for i in range(n)]
+    o = [x * (1 + rnd.gauss(0, 0.004)) for x in c]
+    h = [max(a, b) * (1 + abs(rnd.gauss(0, 0.006))) for a, b in zip(o, c)]
+    lo = [min(a, b) * (1 - abs(rnd.gauss(0, 0.006))) for a, b in zip(o, c)]
+    v = [int(rnd.uniform(0.6, 1.6) * 3_000_000) for _ in range(n)]
+    bank = "Banks" in industry
+    fund = {
+        "trailingPE": rnd.uniform(9, 38), "forwardPE": rnd.uniform(8, 32), "priceToBook": rnd.uniform(1.2, 9),
+        "priceToSalesTrailing12Months": rnd.uniform(1, 7), "enterpriseToEbitda": rnd.uniform(6, 24),
+        "pegRatio": rnd.uniform(0.6, 2.6), "trailingEps": price / 22, "forwardEps": price / 19,
+        "bookValue": price / 3, "marketCap": price * rnd.uniform(3e9, 6e9), "beta": rnd.uniform(0.6, 1.6),
+        "dividendYield": rnd.uniform(0, 0.04), "payoutRatio": rnd.uniform(0.1, 0.8),
+        "profitMargins": rnd.uniform(0.04, 0.26), "grossMargins": rnd.uniform(0.2, 0.55),
+        "operatingMargins": rnd.uniform(0.07, 0.3), "returnOnEquity": rnd.uniform(0.06, 0.32),
+        "returnOnAssets": rnd.uniform(0.01, 0.1) if not bank else 0.014,
+        "revenueGrowth": rnd.uniform(-0.04, 0.18), "earningsGrowth": rnd.uniform(-0.1, 0.25),
+        "earningsQuarterlyGrowth": rnd.uniform(-0.1, 0.25), "totalRevenue": price * 4e9,
+        "totalCash": price * 1.1e9, "totalDebt": price * rnd.uniform(0.2, 2.2) * 1e9,
+        "debtToEquity": rnd.uniform(5, 160), "currentRatio": rnd.uniform(0.7, 2.4), "quickRatio": rnd.uniform(0.5, 1.8),
+        "freeCashflow": rnd.uniform(-1e9, 8e10), "operatingCashflow": rnd.uniform(1e9, 1.2e11),
+        "heldPercentInsiders": rnd.uniform(0, 0.7), "heldPercentInstitutions": rnd.uniform(0.1, 0.55),
+        "targetMeanPrice": price * rnd.uniform(0.88, 1.25), "targetHighPrice": price * 1.4, "targetLowPrice": price * 0.8,
+        "numberOfAnalystOpinions": rnd.randint(12, 38), "recommendationMean": rnd.uniform(1.6, 3.4),
+        "recommendationKey": "buy", "sharesOutstanding": 3e9, "shortPercentOfFloat": None,
+    }
+    est = price / 90
+    hist = []
+    for i in range(4):
+        e = est * (1 + 0.04 * i)
+        a = e * (1 + rnd.uniform(-0.07, 0.09))
+        hist.append({"quarter": now - (4 - i) * 91 * 86400, "epsActual": round(a, 2), "epsEstimate": round(e, 2),
+                     "surprisePct": (a - e) / e * 100})
+    q = [{"date": f"{(i % 4) + 1}Q{2025 + i // 4}", "revenue": price * 1e9 * (1 + 0.03 * i), "earnings": price * 1.2e8 * (1 + rnd.uniform(-.05, .08) * i)}
+         for i in range(4)]
+    news = []
+    for tpl, src, hrs in DEMO_HEADLINES:
+        title = tpl.format(n=name.split(" Limited")[0])
+        news.append({"title": title, "source": src, "link": "https://example.com/demo", "ts": now - hrs * 3600,
+                     "summary": "Demo summary text. In live mode this holds the article's own description when the publisher exposes it."})
+    rnd.shuffle(news)
+    news = news[:rnd.randint(5, 8)]
+    news.sort(key=lambda x: -x["ts"])
+    for it in news:
+        it["sentiment"], it["score"], it["reasons"], it["category"] = analyse(it["title"], it["summary"])
+    return {
+        "symbol": symbol, "name": name, "exchange": "NSE (demo)", "currency": "INR" if symbol.endswith(".NS") else "USD",
+        "price": c[-1], "prevClose": c[-2], "change": c[-1] - c[-2], "changePct": (c[-1] / c[-2] - 1) * 100,
+        "dayHigh": h[-1], "dayLow": lo[-1], "volume": v[-1], "w52High": max(c[-250:]), "w52Low": min(c[-250:]),
+        "history": {"t": t, "o": o, "h": h, "l": lo, "c": c, "v": v}, "fund": fund,
+        "earnings": {"history": hist, "quarterly": q, "yearly": [], "nextDate": now + 12 * 86400,
+                     "recs": {"strongBuy": 9, "buy": 14, "hold": 8, "sell": 2, "strongSell": 1}},
+        "profile": {"sector": sector, "industry": industry, "longBusinessSummary": f"{name} is a demo company used to try the app offline. Real descriptions appear in live mode.",
+                    "website": "", "fullTimeEmployees": 120000, "city": "Mumbai", "country": "India"},
+        "news": news, "newsSummary": news_summary(news), "warning": None, "fetchedAt": now, "demo": True,
+    }
+
+
+# ----------------------------------------------------------------------------
+# Portfolio storage
+# ----------------------------------------------------------------------------
+def load_portfolio():
+    try:
+        with open(PORTFOLIO_FILE, encoding="utf-8") as f:
+            p = json.load(f)
+    except Exception:
+        p = None
+    if not isinstance(p, dict):
+        p = {"holdings": [], "orders": []}
+        if DEMO:
+            p["holdings"] = [{"symbol": "RELIANCE.NS", "qty": 40, "avg": 1320}, {"symbol": "TCS.NS", "qty": 25, "avg": 3650},
+                             {"symbol": "HDFCBANK.NS", "qty": 120, "avg": 940}, {"symbol": "INFY.NS", "qty": 50, "avg": 1610}]
+    p.setdefault("holdings", [])
+    p.setdefault("orders", [])
+    return p
+
+
+def save_portfolio(p):
+    if DEMO:
+        return  # demo mode never overwrites your saved portfolio
+    clean = {"holdings": [], "orders": []}
+    for h in p.get("holdings", []):
+        try:
+            clean["holdings"].append({"symbol": str(h["symbol"]).upper()[:24], "qty": float(h.get("qty") or 0),
+                                      "avg": float(h.get("avg") or 0)})
+        except Exception:
+            pass
+    for o in p.get("orders", []):
+        try:
+            clean["orders"].append({"id": str(o["id"])[:40], "symbol": str(o["symbol"]).upper()[:24],
+                                    "side": "SELL" if o.get("side") == "SELL" else "BUY",
+                                    "type": str(o.get("type", "Limit"))[:20], "qty": float(o.get("qty") or 0),
+                                    "price": float(o.get("price") or 0),
+                                    "status": o.get("status") if o.get("status") in ("Open", "Executed", "Cancelled") else "Open",
+                                    "date": str(o.get("date", ""))[:20]})
+        except Exception:
+            pass
+    tmp = PORTFOLIO_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(clean, f, indent=2)
+    os.replace(tmp, PORTFOLIO_FILE)
+
+
+# ----------------------------------------------------------------------------
+# Web server
+# ----------------------------------------------------------------------------
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def send(self, code, body, ctype="application/json; charset=utf-8"):
+        if isinstance(body, (dict, list)):
+            body = json.dumps(body, allow_nan=False, default=str).encode()
+        elif isinstance(body, str):
+            body = body.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def authorised(self):
+        if not PASSWORD:
+            return True
+        h = self.headers.get("Authorization", "")
+        if h.startswith("Basic "):
+            try:
+                pw = base64.b64decode(h[6:]).decode("utf-8", "ignore").split(":", 1)[-1]
+                if hmac.compare_digest(pw, PASSWORD):
+                    return True
+            except Exception:
+                pass
+        body = b"Password needed"
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="Stock Desk"')
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        return False
+
+    def do_GET(self):
+        if not self.authorised():
+            return
+        u = urllib.parse.urlparse(self.path)
+        qs = urllib.parse.parse_qs(u.query)
+        try:
+            if u.path in ("/", "/index.html"):
+                page = INDEX_HTML
+                if page is None:
+                    with open(os.path.join(HERE, "index.html"), encoding="utf-8") as f:
+                        page = f.read()
+                page = page.replace("__DEMO__", "true" if DEMO else "false").replace("__HOSTED__", "true" if HOSTED else "false")
+                return self.send(200, page, "text/html; charset=utf-8")
+            if u.path == "/api/portfolio":
+                return self.send(200, load_portfolio())
+            if u.path == "/api/search":
+                return self.send(200, search(qs.get("q", [""])[0]))
+            if u.path == "/api/stock":
+                sym = qs.get("symbol", [""])[0]
+                if not re.fullmatch(r"[A-Za-z0-9.\-^=&]{1,24}", sym):
+                    return self.send(400, {"error": "Bad symbol"})
+                return self.send(200, clean_nan(get_bundle(sym, force=qs.get("force") == ["1"])))
+            return self.send(404, {"error": "Not found"})
+        except Exception as e:
+            return self.send(502, {"error": f"{type(e).__name__}: {e}"})
+
+    def do_POST(self):
+        if not self.authorised():
+            return
+        if self.path != "/api/portfolio":
+            return self.send(404, {"error": "Not found"})
+        try:
+            n = int(self.headers.get("Content-Length", 0))
+            save_portfolio(json.loads(self.rfile.read(min(n, 2_000_000))))
+            return self.send(200, {"ok": True})
+        except Exception as e:
+            return self.send(400, {"error": str(e)})
+
+
+def clean_nan(o):
+    if isinstance(o, float):
+        return None if math.isnan(o) or math.isinf(o) else o
+    if isinstance(o, dict):
+        return {k: clean_nan(v) for k, v in o.items()}
+    if isinstance(o, list):
+        return [clean_nan(v) for v in o]
+    return o
+
+
+def main():
+    global DEMO, HOSTED
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--hosted", action="store_true", help="run as an online service (used on Render etc.)")
+    ap.add_argument("--port", type=int, default=8765)
+    ap.add_argument("--no-browser", action="store_true")
+    ap.add_argument("--demo", action="store_true")
+    a = ap.parse_args()
+    DEMO = a.demo
+    HOSTED = a.hosted or bool(os.environ.get("PORT"))
+    port = int(os.environ.get("PORT", a.port))
+    bind = "0.0.0.0" if HOSTED else "127.0.0.1"
+    srv = None
+    for p in range(port, port + 20):
+        try:
+            srv = ThreadingHTTPServer((bind, p), Handler)
+            port = p
+            break
+        except OSError:
+            continue
+    if not srv:
+        sys.exit("Could not find a free port.")
+    url = f"http://127.0.0.1:{port}"
+    print(f"Stock Desk running at {url}{'  (DEMO DATA)' if DEMO else ''}\nPress Ctrl+C to stop.")
+    if not a.no_browser and not HOSTED:
+        threading.Timer(0.8, lambda: webbrowser.open(url)).start()
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopped.")
+
+
+if __name__ == "__main__":
+    main()
